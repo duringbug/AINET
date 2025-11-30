@@ -67,6 +67,7 @@ dist/
 # 如果你项目里有 checkpoints 或 model 文件夹，可以单独忽略
 data/
 outputs/
+outputs_bak/
 checkpoints/
 *.pt
 *.pth
