@@ -1413,7 +1413,7 @@ def main():
 
         # Optimizer
         'optimizer': 'adamw',
-        'learning_rate': 5e-4,
+        'learning_rate': 1e-4,  # Lowered from 5e-4 for stability
         'weight_decay': 0.01,
         'beta1': 0.9,
         'beta2': 0.999,
@@ -1422,7 +1422,7 @@ def main():
 
         # Learning rate scheduler
         'scheduler': 'reduce_on_plateau',
-        'warmup_epochs': 2,
+        'warmup_epochs': 0,  # Disabled warmup to prevent LR instability
         'lr_patience': 3,
         'lr_decay_factor': 0.5,
         'lr_step_size': 10,
