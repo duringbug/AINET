@@ -1,0 +1,72 @@
+# =======================
+# Python 字节码 / 缓存
+# =======================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =======================
+# 虚拟环境
+# =======================
+# 如果你用 venv/virtualenv
+venv/
+env/
+ENV/
+.venv/
+# pipenv
+Pipfile.lock
+
+# =======================
+# 日志 / 临时文件
+# =======================
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# =======================
+# Jupyter Notebook
+# =======================
+.ipynb_checkpoints/
+
+# =======================
+# IDE / 编辑器配置
+# =======================
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# =======================
+# Mac / Linux / Windows 系统文件
+# =======================
+.DS_Store
+Thumbs.db
+
+# =======================
+# Pytest / coverage
+# =======================
+.coverage
+.tox/
+.pytest_cache/
+htmlcov/
+
+# =======================
+# 打包 / 构建文件
+# =======================
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
+
+# =======================
+# 其他
+# =======================
+# 如果你项目里有 checkpoints 或 model 文件夹，可以单独忽略
+data/
+outputs/
+checkpoints/
+*.pt
+*.pth
