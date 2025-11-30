@@ -208,7 +208,7 @@ class ImageToTextGenerator:
     def generate_tokens_with_sampling(self, embedding, max_length=None, temperature=1.0,
                                      top_k=50, top_p=0.9, repetition_penalty=1.2):
         """
-        Generate tokens autoregressively with improved sampling strategies
+        Generate tokens autoregressively with Transformer decoder
 
         Args:
             embedding: Input embedding (1, embed_dim)
@@ -224,36 +224,33 @@ class ImageToTextGenerator:
         if max_length is None:
             max_length = self.config.get('max_text_length', 77)
 
-        batch_size = 1
         device = embedding.device
 
-        # Initialize LSTM hidden state from embedding
-        hidden_dim = self.model.text_decoder.hidden_dim
-        num_layers = self.model.text_decoder.num_layers
+        # Project condition embedding
+        condition = self.model.text_decoder.condition_proj(embedding).unsqueeze(1)
 
-        hidden = self.model.text_decoder.embed_projection(embedding)
-        hidden = hidden.view(batch_size, num_layers, hidden_dim)
-        hidden = hidden.permute(1, 0, 2).contiguous()
-        cell = torch.zeros_like(hidden)
-
-        # Start with [CLS] token (BERT uses 101 for [CLS])
-        # Use token 101 ([CLS]) as start token
+        # Start with [CLS] token
+        generated = torch.tensor([[101]], dtype=torch.long, device=device)
         generated_tokens = []
-        current_token = torch.tensor([[101]], dtype=torch.long, device=device)  # [CLS] token
-
-        # Track generated tokens for repetition penalty
         token_counts = {}
 
         for step in range(max_length):
-            # Embed current token
-            embedded = self.model.text_decoder.word_embedding(current_token)
+            # Embed current sequence
+            x = self.model.text_decoder.word_embedding(generated)
+            seq_len = x.size(1)
+            # Add positional encoding
+            x = x + self.model.text_decoder.pos_encoding[:, :seq_len, :]
+            x = self.model.text_decoder.dropout(x)
 
-            # LSTM step
-            lstm_out, (hidden, cell) = self.model.text_decoder.lstm(embedded, (hidden, cell))
+            # Generate causal mask
+            tgt_mask = self.model.text_decoder.generate_causal_mask(seq_len, device)
 
-            # Project to vocabulary
-            logits = self.model.text_decoder.output_projection(lstm_out)  # (1, 1, vocab_size)
-            logits = logits.squeeze(1)  # (1, vocab_size)
+            # Pass through transformer layers
+            for layer in self.model.text_decoder.layers:
+                x = layer(x, condition, tgt_mask)
+
+            # Get logits for last position
+            logits = self.model.text_decoder.output_projection(x[:, -1, :])  # (1, vocab_size)
 
             # Apply repetition penalty
             if repetition_penalty != 1.0 and len(generated_tokens) > 0:
@@ -275,9 +272,7 @@ class ImageToTextGenerator:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
                 cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
 
-                # Remove tokens with cumulative probability above the threshold
                 sorted_indices_to_remove = cumulative_probs > top_p
-                # Keep at least one token
                 sorted_indices_to_remove[..., 0] = False
 
                 indices_to_remove = sorted_indices_to_remove.scatter(
@@ -290,7 +285,7 @@ class ImageToTextGenerator:
             next_token = torch.multinomial(probs, num_samples=1)  # (1, 1)
 
             # Get token ID
-            token_id = next_token.item()
+            token_id = next_token[0, 0].item()
 
             # Stop if we hit [SEP] (102) or [PAD] (0)
             if token_id in [0, 102]:
@@ -298,20 +293,16 @@ class ImageToTextGenerator:
 
             # Add to generated sequence
             generated_tokens.append(token_id)
-
-            # Update token count for repetition penalty
             token_counts[token_id] = token_counts.get(token_id, 0) + 1
 
-            # Update current token for next iteration
-            current_token = next_token
+            # Append to sequence for next iteration
+            generated = torch.cat([generated, next_token], dim=1)
 
         # Convert to tensor
         if len(generated_tokens) == 0:
-            # If nothing generated, return empty tensor
-            generated_tokens = [0]  # PAD token
+            generated_tokens = [0]
 
         result = torch.tensor(generated_tokens, dtype=torch.long, device=device)
-
         return result
 
     def decode_tokens(self, tokens):

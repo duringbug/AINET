@@ -432,81 +432,171 @@ class ImageDecoder(nn.Module):
         return images
 
 
-class TextDecoder(nn.Module):
-    """Text decoder - generates text from embeddings"""
+class TransformerDecoderLayer(nn.Module):
+    """Single Transformer decoder layer with self-attention and cross-attention"""
 
-    def __init__(self, vocab_size, embed_dim=512, hidden_dim=256, num_layers=2, max_length=77):
+    def __init__(self, d_model, nhead=8, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+        # Self-attention
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+
+        # Cross-attention (attend to condition embedding)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout2 = nn.Dropout(dropout)
+
+        # Feedforward
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model)
+        )
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout3 = nn.Dropout(dropout)
+
+    def forward(self, x, condition, tgt_mask=None):
+        """
+        Args:
+            x: (batch, seq_len, d_model) - decoder input
+            condition: (batch, 1, d_model) - conditioning from image/text embedding
+            tgt_mask: attention mask for causal decoding
+        """
+        # Self-attention with residual
+        x2 = self.self_attn(x, x, x, attn_mask=tgt_mask, need_weights=False)[0]
+        x = x + self.dropout1(x2)
+        x = self.norm1(x)
+
+        # Cross-attention with residual
+        x2 = self.cross_attn(x, condition, condition, need_weights=False)[0]
+        x = x + self.dropout2(x2)
+        x = self.norm2(x)
+
+        # Feedforward with residual
+        x2 = self.ffn(x)
+        x = x + self.dropout3(x2)
+        x = self.norm3(x)
+
+        return x
+
+
+class TextDecoder(nn.Module):
+    """Transformer-based text decoder - generates text from embeddings"""
+
+    def __init__(self, vocab_size, embed_dim=512, hidden_dim=512, num_layers=4, max_length=77, nhead=8, dropout=0.1):
         super().__init__()
 
         self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
         self.max_length = max_length
 
-        # Project embedding to LSTM hidden state
-        self.embed_projection = nn.Linear(embed_dim, hidden_dim * num_layers)
-
-        # Word embedding for decoder
+        # Token embedding
         self.word_embedding = nn.Embedding(vocab_size, hidden_dim)
 
-        # LSTM decoder
-        self.lstm = nn.LSTM(
-            hidden_dim,
-            hidden_dim,
-            num_layers,
-            batch_first=True
-        )
+        # Positional encoding
+        self.pos_encoding = nn.Parameter(torch.zeros(1, max_length, hidden_dim))
+
+        # Project condition embedding to hidden_dim
+        self.condition_proj = nn.Linear(embed_dim, hidden_dim)
+
+        # Transformer decoder layers
+        self.layers = nn.ModuleList([
+            TransformerDecoderLayer(hidden_dim, nhead, hidden_dim * 4, dropout)
+            for _ in range(num_layers)
+        ])
 
         # Output projection
         self.output_projection = nn.Linear(hidden_dim, vocab_size)
+        self.dropout = nn.Dropout(dropout)
+
+        # Initialize weights
+        nn.init.normal_(self.word_embedding.weight, std=0.02)
+        nn.init.normal_(self.pos_encoding, std=0.02)
+
+    def generate_causal_mask(self, seq_len, device):
+        """Generate causal mask for autoregressive generation"""
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1)
+        mask = mask.masked_fill(mask == 1, float('-inf'))
+        return mask
 
     def forward(self, embeddings, target_tokens=None, teacher_forcing_ratio=0.5):
         """
         Args:
-            embeddings: (batch_size, embed_dim)
+            embeddings: (batch_size, embed_dim) - condition from image or text encoder
             target_tokens: (batch_size, seq_len) - for training with teacher forcing
             teacher_forcing_ratio: probability of using teacher forcing
         """
         batch_size = embeddings.size(0)
         device = embeddings.device
 
-        # Initialize hidden state from embeddings
-        hidden = self.embed_projection(embeddings)  # (batch_size, hidden_dim * num_layers)
-        hidden = hidden.view(batch_size, self.num_layers, self.hidden_dim)
-        hidden = hidden.permute(1, 0, 2).contiguous()  # (num_layers, batch_size, hidden_dim)
-        cell = torch.zeros_like(hidden)
+        # Project and expand condition embedding
+        condition = self.condition_proj(embeddings).unsqueeze(1)  # (batch, 1, hidden_dim)
 
-        # Start with <SOS> token (token id 2)
-        decoder_input = torch.full((batch_size, 1), 2, dtype=torch.long, device=device)
+        # If target_tokens provided, use teacher forcing mode (regardless of training/eval)
+        if target_tokens is not None:
+            seq_len = target_tokens.size(1)
+            # Embed tokens
+            x = self.word_embedding(target_tokens)  # (batch, seq_len, hidden_dim)
+            # Add positional encoding
+            x = x + self.pos_encoding[:, :seq_len, :]
+            x = self.dropout(x)
 
-        outputs = []
+            # Generate causal mask
+            tgt_mask = self.generate_causal_mask(seq_len, device)
 
-        for t in range(self.max_length):
-            # Embed current input
-            embedded = self.word_embedding(decoder_input)  # (batch_size, 1, hidden_dim)
-
-            # LSTM step
-            lstm_out, (hidden, cell) = self.lstm(embedded, (hidden, cell))
+            # Pass through transformer layers
+            for layer in self.layers:
+                x = layer(x, condition, tgt_mask)
 
             # Project to vocabulary
-            output = self.output_projection(lstm_out)  # (batch_size, 1, vocab_size)
-            outputs.append(output)
+            logits = self.output_projection(x)  # (batch, seq_len, vocab_size)
 
-            # Decide next input
-            if target_tokens is not None and torch.rand(1).item() < teacher_forcing_ratio:
-                # Teacher forcing: use ground truth
-                if t < target_tokens.size(1) - 1:
-                    decoder_input = target_tokens[:, t+1:t+2]
-                else:
-                    decoder_input = torch.full((batch_size, 1), 0, dtype=torch.long, device=device)
-            else:
-                # Use predicted token
-                decoder_input = output.argmax(dim=-1)
+            return logits
 
-        # Concatenate all outputs
-        outputs = torch.cat(outputs, dim=1)  # (batch_size, max_length, vocab_size)
+        # Inference mode: autoregressive generation
+        else:
+            # Start with [CLS] token (101)
+            generated = torch.full((batch_size, 1), 101, dtype=torch.long, device=device)
 
-        return outputs
+            for t in range(self.max_length):
+                # Embed current sequence
+                x = self.word_embedding(generated)  # (batch, t+1, hidden_dim)
+                seq_len = x.size(1)
+                # Add positional encoding
+                x = x + self.pos_encoding[:, :seq_len, :]
+                x = self.dropout(x)
+
+                # Generate causal mask
+                tgt_mask = self.generate_causal_mask(seq_len, device)
+
+                # Pass through transformer layers
+                for layer in self.layers:
+                    x = layer(x, condition, tgt_mask)
+
+                # Get logits for last position
+                logits = self.output_projection(x[:, -1:, :])  # (batch, 1, vocab_size)
+
+                # Get next token (greedy decoding in inference mode)
+                next_token = logits.argmax(dim=-1)  # (batch, 1)
+
+                # Append to sequence
+                generated = torch.cat([generated, next_token], dim=1)
+
+                # Stop if all sequences generated [SEP] or [PAD]
+                if (next_token == 0).all() or (next_token == 102).all():
+                    break
+
+            # Return logits for compatibility (convert generated tokens to one-hot-like logits)
+            # Create fake logits: max probability for generated tokens
+            seq_len = min(generated.size(1), self.max_length)
+            logits = torch.zeros(batch_size, seq_len, self.vocab_size, device=device)
+            for i in range(batch_size):
+                for j in range(seq_len):
+                    logits[i, j, generated[i, j]] = 1.0
+
+            return logits
 
 
 class DiffusionModel(nn.Module):
@@ -762,22 +852,30 @@ class GenerativeMultimodalModel(nn.Module):
         return loss, logits
 
     def compute_reconstruction_loss(self, images, tokens, image_features, text_features):
-        """Compute reconstruction loss for decoders"""
-        # Reconstruct images from image features
-        reconstructed_images = self.image_decoder(image_features)
-
-        # Normalize original images to [-1, 1] to match decoder output
+        """Compute reconstruction loss including cross-modal reconstruction"""
         images_normalized = images * 2.0 - 1.0
-        image_recon_loss = nn.MSELoss()(reconstructed_images, images_normalized)
 
-        # Reconstruct text from text features
-        reconstructed_text_logits = self.text_decoder(text_features, target_tokens=tokens, teacher_forcing_ratio=0.5)
+        # Auto-reconstruction: same modality
+        auto_images = self.image_decoder(image_features)
+        auto_text = self.text_decoder(text_features, target_tokens=tokens, teacher_forcing_ratio=0.5)
 
-        # Reshape for cross entropy
-        reconstructed_text_logits = reconstructed_text_logits.view(-1, self.vocab_size)
-        tokens_flat = tokens.view(-1)
+        auto_image_loss = nn.MSELoss()(auto_images, images_normalized)
+        auto_text_loss = nn.CrossEntropyLoss(ignore_index=0)(
+            auto_text.view(-1, self.vocab_size), tokens.view(-1)
+        )
 
-        text_recon_loss = nn.CrossEntropyLoss(ignore_index=0)(reconstructed_text_logits, tokens_flat)
+        # Cross-modal reconstruction: KEY FIX - train decoders to accept other modality
+        cross_images = self.image_decoder(text_features)  # text -> image
+        cross_text = self.text_decoder(image_features, target_tokens=tokens, teacher_forcing_ratio=0.5)  # image -> text
+
+        cross_image_loss = nn.MSELoss()(cross_images, images_normalized)
+        cross_text_loss = nn.CrossEntropyLoss(ignore_index=0)(
+            cross_text.view(-1, self.vocab_size), tokens.view(-1)
+        )
+
+        # Combine with higher weight on cross-modal (what we actually need for inference)
+        image_recon_loss = auto_image_loss + 1.5 * cross_image_loss
+        text_recon_loss = auto_text_loss + 1.5 * cross_text_loss
 
         return image_recon_loss, text_recon_loss
 
@@ -1012,62 +1110,24 @@ class Trainer:
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         logger.info(f"Model initialized with {total_params:,} parameters ({trainable_params:,} trainable)")
 
-        # Initialize optimizer with momentum
-        optimizer_name = config.get('optimizer', 'adamw')
-        if optimizer_name.lower() == 'adamw':
-            self.optimizer = optim.AdamW(
-                self.model.parameters(),
-                lr=config['learning_rate'],
-                betas=(config.get('beta1', 0.9), config.get('beta2', 0.999)),
-                weight_decay=config.get('weight_decay', 0.01)
-            )
-        elif optimizer_name.lower() == 'sgd':
-            self.optimizer = optim.SGD(
-                self.model.parameters(),
-                lr=config['learning_rate'],
-                momentum=config.get('momentum', 0.9),
-                weight_decay=config.get('weight_decay', 0.01),
-                nesterov=config.get('nesterov', True)
-            )
-        else:
-            raise ValueError(f"Unknown optimizer: {optimizer_name}")
+        # Initialize optimizer
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=config['learning_rate'],
+            weight_decay=config.get('weight_decay', 0.01)
+        )
+        logger.info(f"Using AdamW optimizer with lr={config['learning_rate']}")
 
-        logger.info(f"Using {optimizer_name} optimizer with lr={config['learning_rate']}")
-
-        # Learning rate scheduler with warmup
-        scheduler_name = config.get('scheduler', 'reduce_on_plateau')
+        # Learning rate scheduler
         warmup_epochs = config.get('warmup_epochs', 0)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=config['num_epochs'],
+            eta_min=config.get('min_lr', 1e-7)
+        )
+        logger.info(f"Using CosineAnnealingLR scheduler")
 
-        if scheduler_name == 'reduce_on_plateau':
-            # ReduceLROnPlateau - reduces LR when validation loss plateaus
-            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer,
-                mode='min',
-                factor=config.get('lr_decay_factor', 0.5),
-                patience=config.get('lr_patience', 3),
-                min_lr=config.get('min_lr', 1e-7)
-            )
-            logger.info(f"Using ReduceLROnPlateau scheduler (patience={config.get('lr_patience', 3)})")
-        elif scheduler_name == 'cosine':
-            # Cosine Annealing
-            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer,
-                T_max=config['num_epochs'],
-                eta_min=config.get('min_lr', 1e-7)
-            )
-            logger.info(f"Using CosineAnnealingLR scheduler")
-        elif scheduler_name == 'step':
-            # Step decay
-            self.scheduler = optim.lr_scheduler.StepLR(
-                self.optimizer,
-                step_size=config.get('lr_step_size', 10),
-                gamma=config.get('lr_decay_factor', 0.5)
-            )
-            logger.info(f"Using StepLR scheduler (step_size={config.get('lr_step_size', 10)})")
-        else:
-            raise ValueError(f"Unknown scheduler: {scheduler_name}")
-
-        # Warmup scheduler wrapper
+        # Warmup scheduler
         if warmup_epochs > 0:
             logger.info(f"Using warmup for {warmup_epochs} epochs")
             self.warmup_scheduler = optim.lr_scheduler.LinearLR(
@@ -1360,17 +1420,11 @@ class Trainer:
 
             # Update learning rate scheduler
             if self.use_warmup and epoch < self.warmup_epochs:
-                # During warmup, use warmup scheduler
                 self.warmup_scheduler.step()
                 logger.info(f"Warmup phase: epoch {epoch+1}/{self.warmup_epochs}")
             else:
-                # After warmup, use main scheduler
-                if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-                    self.scheduler.step(val_loss)
-                else:
-                    self.scheduler.step()
+                self.scheduler.step()
 
-            # Log current learning rate
             current_lr = self.optimizer.param_groups[0]['lr']
             logger.info(f"Current learning rate: {current_lr:.2e}")
 
@@ -1416,9 +1470,9 @@ def main():
         'data_dir': 'data/flickr30k',
         'output_dir': 'outputs',
 
-        # Model
+        # Model - increased capacity
         'vocab_size': 10000,
-        'embed_dim': 256,
+        'embed_dim': 512,  # 256 -> 512 for better representation
         'image_size': 224,
         'max_text_length': 77,
         'use_simple_cnn': True,
@@ -1426,13 +1480,13 @@ def main():
         # BERT
         'bert_model_name': 'bert-base-uncased',
         'cache_dir': './models/bert_cache',
-        'freeze_bert': False,
+        'freeze_bert': True,  # Freeze BERT for faster training
 
         # Generative model
         'use_generative': True,
         'num_diffusion_steps': 1000,
-        'contrastive_weight': 1.0,
-        'recon_weight': 0.5,
+        'contrastive_weight': 0.5,  # Reduced from 1.0
+        'recon_weight': 1.5,        # Increased from 0.5 - reconstruction is key
         'diffusion_weight': 0.3,
 
         # Dataset split
@@ -1440,25 +1494,18 @@ def main():
         'random_seed': 42,
 
         # Training
-        'num_epochs': 20,
+        'num_epochs': 30,  # Increased for better convergence
         'batch_size': 32,
         'num_workers': 4,
 
         # Optimizer
         'optimizer': 'adamw',
-        'learning_rate': 1e-4,  # Lowered from 5e-4 for stability
+        'learning_rate': 1e-4,  # Lower LR for stability
         'weight_decay': 0.01,
-        'beta1': 0.9,
-        'beta2': 0.999,
-        'momentum': 0.9,
-        'nesterov': True,
 
         # Learning rate scheduler
-        'scheduler': 'reduce_on_plateau',
-        'warmup_epochs': 0,  # Disabled warmup to prevent LR instability
-        'lr_patience': 3,
-        'lr_decay_factor': 0.5,
-        'lr_step_size': 10,
+        'scheduler': 'cosine',  # Cosine annealing
+        'warmup_epochs': 2,
         'min_lr': 1e-7,
 
         # Save

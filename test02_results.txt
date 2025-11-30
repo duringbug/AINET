@@ -5,36 +5,36 @@ Image-to-Text Generation Results
 
 Image: test/picture/01.jpg
 --------------------------------------------------------------------------------
-Caption 1: a man man is a on and and brown little children in by by the the.
-Caption 2: the person holding holding up up a
-Caption 3: three young boys men in,, black black shirt a an an woods sky.
+Caption 1: splash splash splash splash splash re re re re retedtedtedtedtedtedtedted joy joy joy shade shade shade shade ex ex ex ex ex gets gets gets gets gets baseball baseball baseball baseball baseball motorized motorized motorized motorized chip chip chip chip motorcycle motorcycle motorcycle motorcycle play play play play play small small small small glasses glasses glasses glasses glasses san san san san architectural
+Caption 2: viewing viewing viewing viewing viewing employees employees employees employees poles poles poles poles legs legs legs legs legs legs passenger passenger passenger passenger sphere sphere sphere indonesian indonesian sunshine sunshine sunshine sunshine sunshine tires tires tires tires blow blow blow blow blow repair repair repair repair seattle seattle seattle pieces pieces pieces piecesguardguardguardguard flute flute flutegsgsgsgs game game game game late late late adult
+Caption 3: circle circle circle circle blue blue blue blue blue blue blue shot shot shot shot tropical tropical tropical tropical kids kids kids kids kids sit sit sit sit lawn lawn lawn lawn lawn lawn littered littered littered littered blackberry blackberry blackberry shorter shorter shorter shorter proximity proximity proximity proximity ready ready ready ready car car car car car softball softball softball softball teenage teenage teenage teenage teenage mouth mouth mouth mouth mouth
 
 Image: test/picture/02.jpg
 --------------------------------------------------------------------------------
-Caption 1: a man man in a with with red red,, the the beach.
-Caption 2: a white white shirt playing riding an her water with with his through to
-Caption 3: a a man and white white dog jumping jumping on the.
+Caption 1: draped draped draped draped 55 55 55 horrible horrible inventor inventorritesrites investigates investigates investigates dread dread dread dread dread dread paper paper paper paper paper framed framed framed framed framed framed girl girl girl girl shore shore shore shore a a a a a cheeks cheeks cheeks bright bright bright bright bright bucket bucket bucket bucket bucket gathers gathers gathers gathers crowd crowd crowd crowd stripe stripe infant infant infant infant
+Caption 2: pan pan pan pan pan next next next next next next stairway stairway stairway stairway teacher teacher teacher teachertttt having having having having lay lay lay layddddd pig pig pig pig pig looking looking looking looking looking waking waking waking waking waking skull skull skull skull event event event event way way way way mike mike mike tong tong motor motor motor motor
+Caption 3: leaning leaning leaning leaning leaningghghghgh ex ex ex ex retail retail retail retail retail cloudy cloudy cloudy cloudy cloudy students students students students some some some some some stone stone stone stone stone safety safety safety safety laughing laughing laughing laughing laughing laughing sneakers sneakers sneakers sneakers sprint sprint sprint sprint client client case case case case buys buys buys buys waterfall waterfall waterfall waterfall pig pig pig
 
 Image: test/picture/03.jpeg
 --------------------------------------------------------------------------------
-Caption 1: the little boy - - shirt is is on on his back back.
-Caption 2: young women wearing wearing green green shirt and and a on on an an outdoor
-Caption 3: the the dark dark,, a two two are on on another another dog
+Caption 1: protest protest protest protest protest coffee coffee coffee coffee cliff cliff cliff cliff cliff are are are are are still still still track track track track track track enjoy enjoy enjoy enjoy beak beak beak beakkelkelkelkel volleyball volleyball volleyball volleyballghghghgh man man man man man haired haired haired haired male male male male plastic plastic plastic plasticclesclescles men men men men misses
+Caption 2: buddhist buddhist buddhist buddhist orange orange orange orange orange fur fur fur fur creek creek creek creek creek for for for for drums drums drums drums drums blackberry blackberry blackberry halves halves halves bon bon bon arabic arabic arabic arabic arabic ale ale ale toe toe toeboxboxbox camera camera camera camera monk monk monk attempts attempts attempts attempts attempts attempts competition competition competition information information information informationversvers
+Caption 3: ##gygygygygygy movie movie movie movie little little little little during during during during during orange orange orange orange taking taking taking taking taking moment moment moment moment moment moment modern modern modern modern snack snack snack snack snack snack gate gate gate gate gate surgery surgery surgery leaves leaves leaves leaves leaves sort sort sort sortiveiveive floors floors floors floors bench bench bench bench
 
 Image: test/picture/01.jpg
 --------------------------------------------------------------------------------
-Caption 1: a man woman in in the the grass is
-Caption 2: a black dog white white and playing playing in the the grass.
+Caption 1: close close close close many many many many after after after blond blond blond blond mirror mirror mirror mirror ka ka ka students students studentsererer inflated inflated inflated mermaid mermaid mermaid mermaid stiffly therefore therefore helium helium helium heliumrcrcrcrc frustration frustration flyers flyers flyers along along along along man man man man practicing practicing practicing buckle buckle buckle buckle onto onto onto scouts scouts scouts stone stone
+Caption 2: leaning leaning leaning drink drink drink drink softball softball softball softball car car car car looking looking looking lookinglightslightslights people people people people elevator elevator elevatorclclclcl stopped stopped stopped tile tile tile artwork artwork artwork running running running running running doorway doorway doorway doorway figure figure figure coat coat coat jam jam brown brown brown beer beer beer beerooo judge judge judge fig fig
 
 Image: test/picture/02.jpg
 --------------------------------------------------------------------------------
-Caption 1: a man person jumping jumping the the ocean of
-Caption 2: a black dog white white and in in the background.
+Caption 1: close close close close many many many many after after after blond blond blond blond building building building hug hug hug hug po po po po contents contents contentsneyneytatedtated formally formally formally the the the the repair repair repair999 arguing arguing arguing during during during apartment apartment apartment collecting collecting collectingsaisaisaisaiiersiersiers hospital hospital hospital hospital participating participating participatingversvers
+Caption 2: leaning leaning leaning dun dun dun dun area area area area ramp ramp ramp stand stand stand stand trick trick trick trick shopping shopping shopping shopping backpack backpack backpackieieieieie looking looking looking looking car car car car hat hat hat hat shoulder shoulder shoulder receives receives relax relax relax running running running artwork artwork artworkfighterfighterfighterfighteringinginging vendors vendors vendors small small small
 
 Image: test/picture/03.jpeg
 --------------------------------------------------------------------------------
-Caption 1: a man woman in in the the of of a..
-Caption 2: a black woman white white is playing playing in the the grass.
+Caption 1: close close close close many many many many after after after blond blond blond blond mirror mirror mirror mirror ka ka ka students students studentsererer inflated inflated inflated mermaid mermaid mermaid mermaid stiffly therefore therefore helium helium helium heliumrcrcrcrc frustration frustration flyers flyers flyers along along along along man man man man rink rink rink rink rolls rolls rolls married married married scouts scouts scouts stone stone
+Caption 2: leaning leaning leaning drink drink drink drink softball softball softball softball car car car car looking looking looking lookinglightslightslights people people people people husband husband husband husband chinese chinese chinese chinese chinese bon bon bon bon man man man man stone stone stone stone elaborate elaborate elaborate fish fish fish foreign foreign foreign out out out writing writing writing beer beer beer beerooo judge judge judge fig fig
 
 ================================================================================
 Total: 15 captions generated
