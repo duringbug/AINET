@@ -1,0 +1,41 @@
+================================================================================
+Image-to-Text Generation Results
+================================================================================
+
+
+Image: test/picture/01.jpg
+--------------------------------------------------------------------------------
+Caption 1: a man man is a on and and brown little children in by by the the.
+Caption 2: the person holding holding up up a
+Caption 3: three young boys men in,, black black shirt a an an woods sky.
+
+Image: test/picture/02.jpg
+--------------------------------------------------------------------------------
+Caption 1: a man man in a with with red red,, the the beach.
+Caption 2: a white white shirt playing riding an her water with with his through to
+Caption 3: a a man and white white dog jumping jumping on the.
+
+Image: test/picture/03.jpeg
+--------------------------------------------------------------------------------
+Caption 1: the little boy - - shirt is is on on his back back.
+Caption 2: young women wearing wearing green green shirt and and a on on an an outdoor
+Caption 3: the the dark dark,, a two two are on on another another dog
+
+Image: test/picture/01.jpg
+--------------------------------------------------------------------------------
+Caption 1: a man woman in in the the grass is
+Caption 2: a black dog white white and playing playing in the the grass.
+
+Image: test/picture/02.jpg
+--------------------------------------------------------------------------------
+Caption 1: a man person jumping jumping the the ocean of
+Caption 2: a black dog white white and in in the background.
+
+Image: test/picture/03.jpeg
+--------------------------------------------------------------------------------
+Caption 1: a man woman in in the the of of a..
+Caption 2: a black woman white white is playing playing in the the grass.
+
+================================================================================
+Total: 15 captions generated
+================================================================================

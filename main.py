@@ -566,8 +566,14 @@ class DiffusionModel(nn.Module):
 
         return x_t, noise
 
-    def predict_noise(self, x_t, t):
-        """Predict noise from noisy embeddings"""
+    def predict_noise(self, x_t, t, condition=None):
+        """Predict noise from noisy embeddings
+
+        Args:
+            x_t: Noisy embeddings
+            t: Timestep
+            condition: Optional conditioning (e.g., text embedding)
+        """
         batch_size = x_t.size(0)
         device = x_t.device
 
@@ -583,21 +589,48 @@ class DiffusionModel(nn.Module):
         # Predict noise
         noise_pred = self.noise_predictor(x_in)
 
+        # If condition is provided, guide the noise prediction towards the condition
+        if condition is not None:
+            # Guidance: pull the denoised result towards the condition
+            # This is a simplified form of classifier-free guidance
+            guidance_scale = 0.3
+            direction = condition - x_t
+            noise_pred = noise_pred - guidance_scale * direction
+
         return noise_pred
 
     @torch.no_grad()
-    def sample(self, batch_size, device, condition=None):
-        """Generate embeddings via reverse diffusion (sampling)"""
-        # Start from random noise
-        x_t = torch.randn(batch_size, self.embed_dim, device=device)
+    def sample(self, batch_size, device, condition=None, num_inference_steps=None):
+        """Generate embeddings via reverse diffusion (sampling)
 
-        # Buffers are already on the correct device
+        Args:
+            batch_size: Number of samples to generate
+            device: Device to generate on
+            condition: Optional conditioning signal (e.g., text embedding)
+            num_inference_steps: Number of denoising steps (None = use all timesteps)
+        """
+        # Start from random noise, or from condition + noise
+        if condition is not None:
+            # Start from condition with added noise for diversity
+            x_t = condition + torch.randn_like(condition) * 0.5
+        else:
+            # Start from pure random noise
+            x_t = torch.randn(batch_size, self.embed_dim, device=device)
+
+        # Determine which timesteps to use
+        if num_inference_steps is None:
+            timesteps = list(reversed(range(self.num_timesteps)))
+        else:
+            # Use a subset of timesteps for faster sampling (DDIM-style)
+            step_size = self.num_timesteps // num_inference_steps
+            timesteps = list(reversed(range(0, self.num_timesteps, step_size)))
+
         # Reverse diffusion process
-        for t in reversed(range(self.num_timesteps)):
+        for t in timesteps:
             t_batch = torch.full((batch_size,), t, dtype=torch.long, device=device)
 
-            # Predict noise
-            noise_pred = self.predict_noise(x_t, t_batch)
+            # Predict noise with optional conditioning
+            noise_pred = self.predict_noise(x_t, t_batch, condition=condition)
 
             # Compute coefficients
             alpha_t = self.alphas[t]

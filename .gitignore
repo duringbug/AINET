@@ -68,6 +68,9 @@ dist/
 data/
 outputs/
 outputs_bak/
+test_outputs/
+test_outputs_bak/
+test/
 checkpoints/
 models/
 *.pt
