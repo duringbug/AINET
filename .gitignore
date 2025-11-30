@@ -69,5 +69,6 @@ data/
 outputs/
 outputs_bak/
 checkpoints/
+models/
 *.pt
 *.pth

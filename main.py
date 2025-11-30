@@ -11,6 +11,8 @@ from tqdm import tqdm
 import logging
 import json
 import time
+import os
+from transformers import BertModel, BertTokenizer
 
 # Setup logging
 logging.basicConfig(
@@ -18,52 +20,6 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-class SimpleTokenizer:
-    """Simple tokenizer for text processing"""
-
-    def __init__(self, vocab_size=10000, max_length=77):
-        self.vocab_size = vocab_size
-        self.max_length = max_length
-        self.word2idx = {'<PAD>': 0, '<UNK>': 1, '<SOS>': 2, '<EOS>': 3}
-        self.idx2word = {0: '<PAD>', 1: '<UNK>', 2: '<SOS>', 3: '<EOS>'}
-        self.word_count = {}
-
-    def build_vocab(self, texts):
-        """Build vocabulary from texts"""
-        for text in texts:
-            words = text.lower().split()
-            for word in words:
-                self.word_count[word] = self.word_count.get(word, 0) + 1
-
-        # Sort by frequency
-        sorted_words = sorted(self.word_count.items(), key=lambda x: x[1], reverse=True)
-
-        # Add most frequent words to vocabulary
-        for word, _ in sorted_words[:self.vocab_size - 4]:
-            idx = len(self.word2idx)
-            self.word2idx[word] = idx
-            self.idx2word[idx] = word
-
-        logger.info(f"Vocabulary built with {len(self.word2idx)} words")
-
-    def encode(self, text):
-        """Encode text to token IDs"""
-        words = text.lower().split()
-        tokens = [self.word2idx.get(word, 1) for word in words]  # 1 is <UNK>
-
-        # Truncate or pad
-        if len(tokens) > self.max_length:
-            tokens = tokens[:self.max_length]
-        else:
-            tokens = tokens + [0] * (self.max_length - len(tokens))
-
-        return tokens
-
-    def batch_encode(self, texts):
-        """Encode batch of texts"""
-        return [self.encode(text) for text in texts]
 
 
 class Flickr30kDataset(Dataset):
@@ -258,17 +214,31 @@ class Flickr30kDataset(Dataset):
 
         caption = item['caption']
 
-        # Tokenize caption
+        # Tokenize with BERT
         if self.tokenizer:
-            tokens = self.tokenizer.encode(caption)
-            tokens = torch.tensor(tokens, dtype=torch.long)
+            encoding = self.tokenizer.encode_plus(
+                caption,
+                add_special_tokens=True,
+                max_length=self.tokenizer.model_max_length,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            input_ids = encoding['input_ids'].squeeze(0)
+            attention_mask = encoding['attention_mask'].squeeze(0)
+            tokens = input_ids
         else:
-            tokens = None
+            max_len = 77
+            tokens = torch.zeros(max_len, dtype=torch.long)
+            input_ids = tokens
+            attention_mask = torch.zeros_like(tokens)
 
         return {
             'image': image,
             'caption': caption,
             'tokens': tokens,
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
             'image_path': item['image']
         }
 
@@ -357,43 +327,55 @@ class ImageEncoder(nn.Module):
 
 
 class TextEncoder(nn.Module):
-    """Lightweight text encoder using LSTM"""
+    """Text encoder using pre-trained BERT model"""
 
-    def __init__(self, vocab_size, embed_dim=256, hidden_dim=256, num_layers=1):
+    def __init__(self, embed_dim=256, bert_model_name='bert-base-uncased', freeze_bert=False, cache_dir='./models/bert_cache'):
         super().__init__()
 
         self.embed_dim = embed_dim
 
-        # Word embedding (smaller dimension)
-        self.embedding = nn.Embedding(vocab_size, 128, padding_idx=0)
+        # Load pre-trained BERT model with cache support
+        logger.info(f"Loading BERT model: {bert_model_name}")
+        os.makedirs(cache_dir, exist_ok=True)
 
-        # LSTM encoder (single layer, bidirectional)
-        self.lstm = nn.LSTM(
-            128,
-            hidden_dim,
-            num_layers,
-            batch_first=True,
-            bidirectional=True
+        self.bert = BertModel.from_pretrained(
+            bert_model_name,
+            cache_dir=cache_dir,
+            local_files_only=False
         )
 
-        # Simpler projection
-        self.projection = nn.Linear(hidden_dim * 2, embed_dim)
+        # Optionally freeze BERT parameters for faster training
+        if freeze_bert:
+            for param in self.bert.parameters():
+                param.requires_grad = False
 
-    def forward(self, x):
-        # x: (batch_size, seq_len)
-        embeddings = self.embedding(x)  # (batch_size, seq_len, 128)
+        # BERT output dimension is 768 for bert-base
+        bert_dim = self.bert.config.hidden_size
 
-        # LSTM encoding
-        lstm_out, (hidden, _) = self.lstm(embeddings)
+        # Projection layer to map BERT output to desired embedding dimension
+        self.projection = nn.Sequential(
+            nn.Linear(bert_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim)
+        )
 
-        # Use the last hidden state (concatenate forward and backward)
-        # hidden: (num_layers * 2, batch_size, hidden_dim)
-        forward_hidden = hidden[-2]  # (batch_size, hidden_dim)
-        backward_hidden = hidden[-1]  # (batch_size, hidden_dim)
-        final_hidden = torch.cat([forward_hidden, backward_hidden], dim=1)
+    def forward(self, input_ids, attention_mask):
+        """
+        Args:
+            input_ids: (batch_size, seq_len) - token IDs from BERT tokenizer
+            attention_mask: (batch_size, seq_len) - attention mask
+        """
+        # Get BERT outputs
+        outputs = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
 
-        # Project to embed_dim
-        text_features = self.projection(final_hidden)  # (batch_size, embed_dim)
+        # Use [CLS] token representation (first token)
+        cls_output = outputs.last_hidden_state[:, 0, :]  # (batch_size, bert_dim)
+
+        # Project to target embedding dimension
+        text_features = self.projection(cls_output)  # (batch_size, embed_dim)
 
         return text_features
 
@@ -649,22 +631,22 @@ class DiffusionModel(nn.Module):
 class MultimodalModel(nn.Module):
     """Multimodal model for image-text matching"""
 
-    def __init__(self, vocab_size, embed_dim=512, use_simple_cnn=True):
+    def __init__(self, embed_dim=512, use_simple_cnn=True, bert_model_name='bert-base-uncased', freeze_bert=False, cache_dir='./models/bert_cache'):
         super().__init__()
 
         self.embed_dim = embed_dim
 
         # Image and text encoders
         self.image_encoder = ImageEncoder(embed_dim, use_simple_cnn=use_simple_cnn)
-        self.text_encoder = TextEncoder(vocab_size, embed_dim)
+        self.text_encoder = TextEncoder(embed_dim, bert_model_name=bert_model_name, freeze_bert=freeze_bert, cache_dir=cache_dir)
 
         # Temperature parameter for contrastive learning (higher for easier training)
         self.temperature = nn.Parameter(torch.ones([]) * 0.1)
 
-    def forward(self, images, tokens):
+    def forward(self, images, input_ids, attention_mask):
         # Encode images and text
         image_features = self.image_encoder(images)
-        text_features = self.text_encoder(tokens)
+        text_features = self.text_encoder(input_ids, attention_mask)
 
         # L2 normalize
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
@@ -696,7 +678,8 @@ class GenerativeMultimodalModel(nn.Module):
     """Generative multimodal model with encoders, decoders, and diffusion"""
 
     def __init__(self, vocab_size, embed_dim=512, use_simple_cnn=True,
-                 image_size=224, max_text_length=77, num_diffusion_steps=1000):
+                 image_size=224, max_text_length=77, num_diffusion_steps=1000,
+                 bert_model_name='bert-base-uncased', freeze_bert=False, cache_dir='./models/bert_cache'):
         super().__init__()
 
         self.embed_dim = embed_dim
@@ -704,7 +687,7 @@ class GenerativeMultimodalModel(nn.Module):
 
         # Encoders
         self.image_encoder = ImageEncoder(embed_dim, use_simple_cnn=use_simple_cnn)
-        self.text_encoder = TextEncoder(vocab_size, embed_dim)
+        self.text_encoder = TextEncoder(embed_dim, bert_model_name=bert_model_name, freeze_bert=freeze_bert, cache_dir=cache_dir)
 
         # Decoders
         self.image_decoder = ImageDecoder(embed_dim, image_size)
@@ -716,11 +699,11 @@ class GenerativeMultimodalModel(nn.Module):
         # Temperature parameter for contrastive learning
         self.temperature = nn.Parameter(torch.ones([]) * 0.1)
 
-    def forward(self, images, tokens):
+    def forward(self, images, input_ids, attention_mask):
         """Forward pass for training"""
         # Encode images and text to unified embedding space
         image_features = self.image_encoder(images)
-        text_features = self.text_encoder(tokens)
+        text_features = self.text_encoder(input_ids, attention_mask)
 
         # L2 normalize
         image_features_norm = image_features / image_features.norm(dim=-1, keepdim=True)
@@ -784,18 +767,21 @@ class GenerativeMultimodalModel(nn.Module):
 
         return diffusion_loss
 
-    def compute_total_loss(self, images, tokens,
+    def compute_total_loss(self, images, input_ids, attention_mask, tokens,
                           contrastive_weight=1.0,
                           recon_weight=0.5,
                           diffusion_weight=0.3):
         """Compute combined loss for training"""
         # Forward pass
-        image_features, text_features, image_features_norm, text_features_norm = self.forward(images, tokens)
+        image_features, text_features, image_features_norm, text_features_norm = self.forward(
+            images, input_ids, attention_mask
+        )
 
         # Contrastive loss
         contrastive_loss, logits = self.compute_contrastive_loss(image_features_norm, text_features_norm)
 
         # Reconstruction loss
+        # Use tokens for text decoder (which expects token IDs)
         image_recon_loss, text_recon_loss = self.compute_reconstruction_loss(
             images, tokens, image_features, text_features
         )
@@ -903,23 +889,19 @@ class Trainer:
         with open(self.output_dir / 'config.json', 'w') as f:
             json.dump(config, f, indent=2)
 
-        # Initialize tokenizer
-        logger.info("Initializing tokenizer...")
-        self.tokenizer = SimpleTokenizer(
-            vocab_size=config.get('vocab_size', 10000),
-            max_length=config.get('max_text_length', 77)
-        )
+        # Initialize BERT tokenizer
+        logger.info("Initializing BERT tokenizer...")
+        bert_model_name = config.get('bert_model_name', 'bert-base-uncased')
+        cache_dir = config.get('cache_dir', './models/bert_cache')
+        os.makedirs(cache_dir, exist_ok=True)
 
-        # Load dataset for vocabulary building (use all data)
-        temp_dataset = Flickr30kDataset(
-            config['data_dir'],
-            image_size=config.get('image_size', 224),
-            split='all'
+        self.tokenizer = BertTokenizer.from_pretrained(
+            bert_model_name,
+            cache_dir=cache_dir,
+            local_files_only=False
         )
-
-        # Build vocabulary
-        logger.info("Building vocabulary from captions...")
-        self.tokenizer.build_vocab(temp_dataset.get_all_captions())
+        self.tokenizer.model_max_length = config.get('max_text_length', 77)
+        logger.info(f"BERT tokenizer loaded (vocab size: {self.tokenizer.vocab_size})")
 
         # Load training dataset with tokenizer
         self.train_dataset = Flickr30kDataset(
@@ -961,24 +943,37 @@ class Trainer:
 
         # Initialize model (choose between contrastive-only or generative)
         use_generative = config.get('use_generative', False)
+        bert_model_name = config.get('bert_model_name', 'bert-base-uncased')
+        freeze_bert = config.get('freeze_bert', False)
+        cache_dir = config.get('cache_dir', './models/bert_cache')
 
         if use_generative:
             logger.info("Using GenerativeMultimodalModel (with encoders, decoders, and diffusion)")
             self.model = GenerativeMultimodalModel(
-                vocab_size=len(self.tokenizer.word2idx),
+                vocab_size=self.tokenizer.vocab_size,
                 embed_dim=config.get('embed_dim', 512),
                 use_simple_cnn=config.get('use_simple_cnn', True),
                 image_size=config.get('image_size', 224),
                 max_text_length=config.get('max_text_length', 77),
-                num_diffusion_steps=config.get('num_diffusion_steps', 1000)
+                num_diffusion_steps=config.get('num_diffusion_steps', 1000),
+                bert_model_name=bert_model_name,
+                freeze_bert=freeze_bert,
+                cache_dir=cache_dir
             ).to(self.device)
         else:
             logger.info("Using MultimodalModel (contrastive learning only)")
             self.model = MultimodalModel(
-                vocab_size=len(self.tokenizer.word2idx),
                 embed_dim=config.get('embed_dim', 512),
-                use_simple_cnn=config.get('use_simple_cnn', True)
+                use_simple_cnn=config.get('use_simple_cnn', True),
+                bert_model_name=bert_model_name,
+                freeze_bert=freeze_bert,
+                cache_dir=cache_dir
             ).to(self.device)
+
+        if freeze_bert:
+            logger.info("BERT parameters are frozen for faster training")
+        else:
+            logger.info("BERT parameters will be fine-tuned")
 
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -1108,13 +1103,15 @@ class Trainer:
 
         for batch in pbar:
             images = batch['image'].to(self.device)
+            input_ids = batch['input_ids'].to(self.device)
+            attention_mask = batch['attention_mask'].to(self.device)
             tokens = batch['tokens'].to(self.device)
             batch_size = images.size(0)
 
             # Compute loss based on model type
             if use_generative:
                 loss_dict = self.model.compute_total_loss(
-                    images, tokens,
+                    images, input_ids, attention_mask, tokens,
                     contrastive_weight=self.config.get('contrastive_weight', 1.0),
                     recon_weight=self.config.get('recon_weight', 0.5),
                     diffusion_weight=self.config.get('diffusion_weight', 0.3)
@@ -1126,7 +1123,7 @@ class Trainer:
                 total_recon_loss += loss_dict['recon_loss'].item()
                 total_diffusion_loss += loss_dict['diffusion_loss'].item()
             else:
-                image_features, text_features = self.model(images, tokens)
+                image_features, text_features = self.model(images, input_ids, attention_mask)
                 loss, logits = self.model.compute_loss(image_features, text_features)
 
             # Compute accuracy
@@ -1202,6 +1199,8 @@ class Trainer:
         for batch_idx, batch in enumerate(pbar):
             # Prepare data
             images = batch['image'].to(self.device)
+            input_ids = batch['input_ids'].to(self.device)
+            attention_mask = batch['attention_mask'].to(self.device)
             tokens = batch['tokens'].to(self.device)
             batch_size = images.size(0)
 
@@ -1209,7 +1208,7 @@ class Trainer:
             if use_generative:
                 # Generative model with decoders and diffusion
                 loss_dict = self.model.compute_total_loss(
-                    images, tokens,
+                    images, input_ids, attention_mask, tokens,
                     contrastive_weight=self.config.get('contrastive_weight', 1.0),
                     recon_weight=self.config.get('recon_weight', 0.5),
                     diffusion_weight=self.config.get('diffusion_weight', 0.3)
@@ -1223,7 +1222,7 @@ class Trainer:
                 total_diffusion_loss += loss_dict['diffusion_loss'].item()
             else:
                 # Original contrastive model
-                image_features, text_features = self.model(images, tokens)
+                image_features, text_features = self.model(images, input_ids, attention_mask)
                 loss, logits = self.model.compute_loss(image_features, text_features)
 
             # Compute accuracy
@@ -1368,67 +1367,68 @@ class Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_loss': self.best_loss,
-            'config': self.config,
-            'tokenizer': {
-                'word2idx': self.tokenizer.word2idx,
-                'idx2word': self.tokenizer.idx2word,
-                'vocab_size': self.tokenizer.vocab_size,
-                'max_length': self.tokenizer.max_length
-            }
+            'config': self.config
         }, checkpoint_dir / 'pytorch_model.bin')
+
+        # Save BERT tokenizer separately
+        self.tokenizer.save_pretrained(checkpoint_dir / 'tokenizer')
 
         logger.info(f"Checkpoint saved to {checkpoint_dir}")
 
 
 def main():
     """Main function"""
-    # Configuration
     config = {
-        # Data config
+        # Data
         'data_dir': 'data/flickr30k',
         'output_dir': 'outputs',
 
-        # Model config
+        # Model
         'vocab_size': 10000,
-        'embed_dim': 256,  # Reduced from 512
+        'embed_dim': 256,
         'image_size': 224,
         'max_text_length': 77,
-        'use_simple_cnn': True,  # True: Simple CNN, False: ResNet50
+        'use_simple_cnn': True,
 
-        # Generative model config
-        'use_generative': True,  # True: Use GenerativeMultimodalModel, False: Use MultimodalModel
-        'num_diffusion_steps': 1000,  # Number of diffusion timesteps
-        'contrastive_weight': 1.0,  # Weight for contrastive loss
-        'recon_weight': 0.5,  # Weight for reconstruction loss
-        'diffusion_weight': 0.3,  # Weight for diffusion loss
+        # BERT
+        'bert_model_name': 'bert-base-uncased',
+        'cache_dir': './models/bert_cache',
+        'freeze_bert': False,
 
-        # Dataset split config
-        'train_ratio': 0.9,  # 90% for training, 10% for validation
-        'random_seed': 42,  # For reproducible splits
+        # Generative model
+        'use_generative': True,
+        'num_diffusion_steps': 1000,
+        'contrastive_weight': 1.0,
+        'recon_weight': 0.5,
+        'diffusion_weight': 0.3,
 
-        # Training config
-        'num_epochs': 20,  # More epochs for better convergence
-        'batch_size': 32,  # Reduced batch size for generative model (more memory intensive)
+        # Dataset split
+        'train_ratio': 0.9,
+        'random_seed': 42,
+
+        # Training
+        'num_epochs': 20,
+        'batch_size': 32,
         'num_workers': 4,
 
-        # Optimizer config
-        'optimizer': 'adamw',  # 'adamw' or 'sgd'
+        # Optimizer
+        'optimizer': 'adamw',
         'learning_rate': 5e-4,
         'weight_decay': 0.01,
-        'beta1': 0.9,  # Adam beta1
-        'beta2': 0.999,  # Adam beta2
-        'momentum': 0.9,  # SGD momentum
-        'nesterov': True,  # Use Nesterov momentum for SGD
+        'beta1': 0.9,
+        'beta2': 0.999,
+        'momentum': 0.9,
+        'nesterov': True,
 
-        # Learning rate scheduler config
-        'scheduler': 'reduce_on_plateau',  # 'reduce_on_plateau', 'cosine', or 'step'
-        'warmup_epochs': 2,  # Number of warmup epochs (0 to disable)
-        'lr_patience': 3,  # Patience for ReduceLROnPlateau
-        'lr_decay_factor': 0.5,  # Factor to reduce LR
-        'lr_step_size': 10,  # Step size for StepLR
-        'min_lr': 1e-7,  # Minimum learning rate
+        # Learning rate scheduler
+        'scheduler': 'reduce_on_plateau',
+        'warmup_epochs': 2,
+        'lr_patience': 3,
+        'lr_decay_factor': 0.5,
+        'lr_step_size': 10,
+        'min_lr': 1e-7,
 
-        # Save config
+        # Save
         'save_steps': 500,
     }
 

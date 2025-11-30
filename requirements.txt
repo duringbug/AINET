@@ -1,0 +1,10 @@
+torch
+torchvision
+pillow
+pandas
+tqdm
+python-dotenv
+kagglehub
+matplotlib
+scipy
+transformers
