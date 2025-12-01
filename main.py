@@ -1169,6 +1169,153 @@ class Trainer:
 
         return val_metrics
 
+    @torch.no_grad()
+    def evaluate_full_retrieval(self, dataloader, dataset_name='Validation'):
+        """
+        Evaluate retrieval performance on the full dataset
+        Computes image-to-text and text-to-image retrieval metrics
+        """
+        self.model.eval()
+        logger.info(f"Computing {dataset_name} retrieval metrics on full dataset...")
+
+        # Extract all image and text features
+        all_image_features = []
+        all_text_features = []
+        all_image_paths = []
+        all_captions = []
+
+        for batch in tqdm(dataloader, desc=f'Extracting {dataset_name} features', ncols=100):
+            images = batch['image'].to(self.device)
+            tokens = batch['tokens'].to(self.device)
+
+            # Encode
+            if isinstance(self.model, GenerativeMultimodalModel):
+                image_features, text_features, image_features_norm, text_features_norm = self.model(images, tokens)
+            else:
+                image_features, text_features = self.model(images, tokens)
+                # L2 normalize
+                image_features_norm = image_features / image_features.norm(dim=-1, keepdim=True)
+                text_features_norm = text_features / text_features.norm(dim=-1, keepdim=True)
+
+            all_image_features.append(image_features_norm.cpu())
+            all_text_features.append(text_features_norm.cpu())
+            all_image_paths.extend(batch['image_path'])
+            all_captions.extend(batch['caption'])
+
+        # Concatenate all features
+        all_image_features = torch.cat(all_image_features, dim=0)  # (N, embed_dim)
+        all_text_features = torch.cat(all_text_features, dim=0)    # (N, embed_dim)
+
+        num_samples = all_image_features.size(0)
+        logger.info(f"Total samples: {num_samples}")
+
+        # Compute similarity matrix
+        # For large datasets, compute in chunks to avoid OOM
+        chunk_size = 1000
+        similarity_matrix = []
+
+        logger.info("Computing similarity matrix...")
+        for i in tqdm(range(0, num_samples, chunk_size), desc='Computing similarities', ncols=100):
+            end_i = min(i + chunk_size, num_samples)
+            image_chunk = all_image_features[i:end_i]  # (chunk_size, embed_dim)
+
+            # Compute similarity with all text features
+            sim_chunk = torch.matmul(image_chunk, all_text_features.t())  # (chunk_size, N)
+            similarity_matrix.append(sim_chunk)
+
+        similarity_matrix = torch.cat(similarity_matrix, dim=0)  # (N, N)
+
+        # Compute Image-to-Text retrieval metrics
+        logger.info("Computing Image-to-Text retrieval...")
+        i2t_ranks = []
+        for i in range(num_samples):
+            # Get similarities for image i to all texts
+            sims = similarity_matrix[i]  # (N,)
+
+            # Argsort in descending order
+            sorted_indices = torch.argsort(sims, descending=True)
+
+            # Find rank of the correct text (index i)
+            rank = (sorted_indices == i).nonzero(as_tuple=True)[0].item()
+            i2t_ranks.append(rank)
+
+        i2t_ranks = torch.tensor(i2t_ranks)
+
+        # Compute recall metrics
+        i2t_r1 = (i2t_ranks < 1).float().mean().item()
+        i2t_r5 = (i2t_ranks < 5).float().mean().item()
+        i2t_r10 = (i2t_ranks < 10).float().mean().item()
+        i2t_median = torch.median(i2t_ranks).item() + 1  # +1 because rank is 0-indexed
+        i2t_mean = i2t_ranks.float().mean().item() + 1
+
+        # Compute Text-to-Image retrieval metrics
+        logger.info("Computing Text-to-Image retrieval...")
+        t2i_ranks = []
+        for i in range(num_samples):
+            # Get similarities for text i to all images
+            sims = similarity_matrix[:, i]  # (N,)
+
+            # Argsort in descending order
+            sorted_indices = torch.argsort(sims, descending=True)
+
+            # Find rank of the correct image (index i)
+            rank = (sorted_indices == i).nonzero(as_tuple=True)[0].item()
+            t2i_ranks.append(rank)
+
+        t2i_ranks = torch.tensor(t2i_ranks)
+
+        # Compute recall metrics
+        t2i_r1 = (t2i_ranks < 1).float().mean().item()
+        t2i_r5 = (t2i_ranks < 5).float().mean().item()
+        t2i_r10 = (t2i_ranks < 10).float().mean().item()
+        t2i_median = torch.median(t2i_ranks).item() + 1
+        t2i_mean = t2i_ranks.float().mean().item() + 1
+
+        # Compute average metrics
+        avg_r1 = (i2t_r1 + t2i_r1) / 2
+        avg_r5 = (i2t_r5 + t2i_r5) / 2
+        avg_r10 = (i2t_r10 + t2i_r10) / 2
+
+        # Log results
+        logger.info(f"\n{'='*60}")
+        logger.info(f"{dataset_name} Retrieval Results (on {num_samples} samples)")
+        logger.info(f"{'='*60}")
+        logger.info(f"Image-to-Text Retrieval:")
+        logger.info(f"  R@1:  {i2t_r1*100:.2f}%")
+        logger.info(f"  R@5:  {i2t_r5*100:.2f}%")
+        logger.info(f"  R@10: {i2t_r10*100:.2f}%")
+        logger.info(f"  Median Rank: {i2t_median:.1f}")
+        logger.info(f"  Mean Rank:   {i2t_mean:.1f}")
+        logger.info(f"")
+        logger.info(f"Text-to-Image Retrieval:")
+        logger.info(f"  R@1:  {t2i_r1*100:.2f}%")
+        logger.info(f"  R@5:  {t2i_r5*100:.2f}%")
+        logger.info(f"  R@10: {t2i_r10*100:.2f}%")
+        logger.info(f"  Median Rank: {t2i_median:.1f}")
+        logger.info(f"  Mean Rank:   {t2i_mean:.1f}")
+        logger.info(f"")
+        logger.info(f"Average:")
+        logger.info(f"  R@1:  {avg_r1*100:.2f}%")
+        logger.info(f"  R@5:  {avg_r5*100:.2f}%")
+        logger.info(f"  R@10: {avg_r10*100:.2f}%")
+        logger.info(f"{'='*60}\n")
+
+        return {
+            'i2t_r1': i2t_r1,
+            'i2t_r5': i2t_r5,
+            'i2t_r10': i2t_r10,
+            'i2t_median_rank': i2t_median,
+            'i2t_mean_rank': i2t_mean,
+            't2i_r1': t2i_r1,
+            't2i_r5': t2i_r5,
+            't2i_r10': t2i_r10,
+            't2i_median_rank': t2i_median,
+            't2i_mean_rank': t2i_mean,
+            'avg_r1': avg_r1,
+            'avg_r5': avg_r5,
+            'avg_r10': avg_r10
+        }
+
     def train_epoch(self, epoch):
         """Train for one epoch"""
         self.model.train()
@@ -1317,14 +1464,33 @@ class Trainer:
         logger.info(f"Validation steps per epoch: {len(self.val_loader)}")
 
         best_val_loss = float('inf')
+        best_retrieval_r1 = 0.0
+
+        # Frequency for full retrieval evaluation (in epochs)
+        eval_retrieval_freq = self.config.get('eval_retrieval_freq', 5)
 
         for epoch in range(self.config['num_epochs']):
             # Train one epoch
             avg_loss = self.train_epoch(epoch)
 
-            # Evaluate on validation set
+            # Evaluate on validation set (batch-level metrics)
             val_metrics = self.evaluate()
             val_loss = val_metrics['val_loss']
+
+            # Perform full retrieval evaluation periodically
+            if (epoch + 1) % eval_retrieval_freq == 0 or (epoch + 1) == self.config['num_epochs']:
+                logger.info(f"\n{'*'*60}")
+                logger.info(f"Running full retrieval evaluation at epoch {epoch+1}...")
+                logger.info(f"{'*'*60}")
+
+                retrieval_metrics = self.evaluate_full_retrieval(self.val_loader, dataset_name='Validation')
+
+                # Track best retrieval performance
+                current_r1 = retrieval_metrics['avg_r1']
+                if current_r1 > best_retrieval_r1:
+                    best_retrieval_r1 = current_r1
+                    self.save_checkpoint('best_retrieval_model')
+                    logger.info(f"New best retrieval model saved with R@1: {current_r1*100:.2f}%")
 
             # Update learning rate scheduler
             if self.use_warmup and epoch < self.warmup_epochs:
@@ -1355,6 +1521,15 @@ class Trainer:
 
         logger.info("Training completed!")
         logger.info(f"Best validation loss: {best_val_loss:.4f}")
+        logger.info(f"Best retrieval R@1: {best_retrieval_r1*100:.2f}%")
+
+        # Final full retrieval evaluation on validation set
+        logger.info(f"\n{'='*60}")
+        logger.info("Final Retrieval Evaluation")
+        logger.info(f"{'='*60}")
+        final_retrieval_metrics = self.evaluate_full_retrieval(self.val_loader, dataset_name='Final Validation')
+
+        return final_retrieval_metrics
 
     def save_checkpoint(self, name):
         """Save checkpoint"""
@@ -1430,6 +1605,9 @@ def main():
 
         # Save config
         'save_steps': 500,
+
+        # Evaluation config
+        'eval_retrieval_freq': 5,  # Run full retrieval evaluation every N epochs (set to 1 for every epoch)
     }
 
     # Check data directory
