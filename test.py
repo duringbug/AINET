@@ -107,14 +107,17 @@ class TextToImageGenerator:
     def generate_from_text(self, text_prompts, num_samples_per_prompt=1, use_diffusion=True,
                           num_inference_steps=50, seed=None):
         """
-        Generate images from text descriptions using diffusion model
+        Generate images from text descriptions using latent diffusion model
 
         Args:
             text_prompts: List of text descriptions or single string
             num_samples_per_prompt: Number of images to generate per prompt
-            use_diffusion: If True, use multi-step diffusion (slow but better);
-                          If False, use direct decoder (fast but lower quality)
-            num_inference_steps: Number of diffusion steps (50-1000, higher = slower but better)
+            use_diffusion: If True, use latent diffusion UNet (RECOMMENDED, high quality);
+                          If False, use direct decoder (fast but much lower quality)
+            num_inference_steps: Number of diffusion steps (10-100)
+                - 10-20: Fast, decent quality
+                - 30-50: Good quality (recommended)
+                - 50-100: Best quality, slower
             seed: Random seed for reproducibility (None = random every time)
 
         Returns:
@@ -128,9 +131,9 @@ class TextToImageGenerator:
 
         for prompt in text_prompts:
             if use_diffusion:
-                logger.info(f"Generating image for: '{prompt}' (diffusion steps={num_inference_steps})")
+                logger.info(f"Generating image for: '{prompt}' (latent diffusion, steps={num_inference_steps})")
             else:
-                logger.info(f"Generating image for: '{prompt}' (direct decoding)")
+                logger.info(f"Generating image for: '{prompt}' (direct decoding, no diffusion)")
 
             # Tokenize text
             encoding = self.tokenizer.encode_plus(
@@ -155,26 +158,18 @@ class TextToImageGenerator:
                 text_embedding = self.model.text_encoder(input_ids, attention_mask)
 
                 if use_diffusion:
-                    # Use diffusion model for multi-step iterative generation
-                    # This produces higher quality but is slower
-                    generated_embedding = self.model.diffusion.sample(
-                        batch_size=1,
-                        device=self.device,
-                        condition=text_embedding,
+                    # NEW: Use latent diffusion model for high-quality generation
+                    # This performs iterative denoising in latent space conditioned on text
+                    generated_image = self.model.generate_image_from_text(
+                        text_embedding,
                         num_inference_steps=num_inference_steps
-                    )
+                    )  # Already in [0, 1] range
                 else:
-                    # Direct decoding without diffusion (faster but lower quality)
-                    generated_embedding = text_embedding
-
-                # Decode embedding to image
-                generated_image = self.model.image_decoder(generated_embedding)
-
-                # Convert from [-1, 1] to [0, 1]
-                generated_image = (generated_image + 1.0) / 2.0
-
-                # Clamp to valid range
-                generated_image = torch.clamp(generated_image, 0, 1)
+                    # Fast mode: Direct decoding without diffusion (lower quality)
+                    generated_image = self.model.image_decoder(text_embedding)
+                    # Convert from [-1, 1] to [0, 1]
+                    generated_image = (generated_image + 1.0) / 2.0
+                    generated_image = torch.clamp(generated_image, 0, 1)
 
                 # Convert to PIL Image
                 image_np = generated_image[0].cpu().permute(1, 2, 0).numpy()

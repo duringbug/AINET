@@ -14,6 +14,9 @@ import time
 import os
 from transformers import BertModel, BertTokenizer
 
+# Import new Latent Diffusion model
+from latent_diffusion import LatentDiffusionUNet
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -22,10 +25,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class Flickr30kDataset(Dataset):
-    """Flickr30k image-text dataset"""
+class MultimodalDataset(Dataset):
+    """Universal image-text dataset supporting Flickr30k and MS COCO"""
 
-    def __init__(self, data_dir, image_size=224, tokenizer=None, split='train', train_ratio=0.9, random_seed=42):
+    def __init__(self, data_dir, image_size=224, tokenizer=None, split='train', train_ratio=0.9, random_seed=42, dataset_type='auto'):
         """
         Args:
             data_dir: Dataset root directory
@@ -34,6 +37,7 @@ class Flickr30kDataset(Dataset):
             split: 'train', 'val', or 'all'
             train_ratio: Ratio of data to use for training (default 0.9)
             random_seed: Random seed for reproducible splits
+            dataset_type: 'auto', 'flickr30k', or 'coco'
         """
         self.data_dir = Path(data_dir)
         self.image_size = image_size
@@ -42,16 +46,38 @@ class Flickr30kDataset(Dataset):
         self.train_ratio = train_ratio
         self.random_seed = random_seed
 
-        # Find image directory
-        possible_image_dirs = [
-            self.data_dir / 'flickr30k_images' / 'flickr30k_images',
-            self.data_dir / 'flickr30k_images',
-            self.data_dir / 'Images',
-            self.data_dir / 'images',
-        ]
+        # Auto-detect dataset type
+        if dataset_type == 'auto':
+            if (self.data_dir / 'annotations').exists():
+                self.dataset_type = 'coco'
+                logger.info("Auto-detected: MS COCO dataset")
+            elif (self.data_dir / 'flickr30k_images').exists() or (self.data_dir / 'results.csv').exists():
+                self.dataset_type = 'flickr30k'
+                logger.info("Auto-detected: Flickr30k dataset")
+            else:
+                raise ValueError(f"Cannot auto-detect dataset type in {self.data_dir}")
+        else:
+            self.dataset_type = dataset_type
+
+        # Find image directory based on dataset type
+        if self.dataset_type == 'coco':
+            # COCO has separate train2017/val2017 directories
+            if split == 'train':
+                possible_dirs = [self.data_dir / 'train2017', self.data_dir / 'images' / 'train2017']
+            elif split == 'val':
+                possible_dirs = [self.data_dir / 'val2017', self.data_dir / 'images' / 'val2017']
+            else:  # all - use train
+                possible_dirs = [self.data_dir / 'train2017', self.data_dir / 'images' / 'train2017']
+        else:  # flickr30k
+            possible_dirs = [
+                self.data_dir / 'flickr30k_images' / 'flickr30k_images',
+                self.data_dir / 'flickr30k_images',
+                self.data_dir / 'Images',
+                self.data_dir / 'images',
+            ]
 
         self.image_dir = None
-        for img_dir in possible_image_dirs:
+        for img_dir in possible_dirs:
             if img_dir.exists():
                 self.image_dir = img_dir
                 logger.info(f"Found image directory: {img_dir}")
@@ -101,6 +127,54 @@ class Flickr30kDataset(Dataset):
 
     def _load_captions(self):
         """Load image captions"""
+        captions = []
+
+        # Load captions based on dataset type
+        if self.dataset_type == 'coco':
+            return self._load_coco_captions()
+        else:
+            return self._load_flickr_captions()
+
+    def _load_coco_captions(self):
+        """Load MS COCO captions from JSON annotations"""
+        # COCO annotation files
+        if self.split == 'train':
+            ann_file = self.data_dir / 'annotations' / 'captions_train2017.json'
+        elif self.split == 'val':
+            ann_file = self.data_dir / 'annotations' / 'captions_val2017.json'
+        else:  # all
+            ann_file = self.data_dir / 'annotations' / 'captions_train2017.json'
+
+        if not ann_file.exists():
+            raise FileNotFoundError(f"COCO annotation file not found: {ann_file}")
+
+        logger.info(f"Loading COCO captions from: {ann_file}")
+
+        with open(ann_file, 'r') as f:
+            coco_data = json.load(f)
+
+        # Build image_id to filename mapping
+        id_to_filename = {}
+        for img in coco_data['images']:
+            id_to_filename[img['id']] = img['file_name']
+
+        # Load captions
+        captions = []
+        for ann in coco_data['annotations']:
+            img_id = ann['image_id']
+            if img_id in id_to_filename:
+                img_path = self.image_dir / id_to_filename[img_id]
+                if img_path.exists():
+                    captions.append({
+                        'image': str(img_path),
+                        'caption': ann['caption']
+                    })
+
+        logger.info(f"Loaded {len(captions)} COCO image-caption pairs")
+        return captions
+
+    def _load_flickr_captions(self):
+        """Load Flickr30k captions"""
         # Try multiple possible locations for caption files
         caption_files = [
             self.data_dir / 'results.csv',
@@ -381,17 +455,20 @@ class TextEncoder(nn.Module):
 
 
 class ImageDecoder(nn.Module):
-    """Image decoder - reconstructs images from embeddings"""
+    """Image decoder - reconstructs images from embeddings or latent features"""
 
     def __init__(self, embed_dim=512, image_size=224):
         super().__init__()
 
         self.image_size = image_size
 
-        # Project embedding to spatial features
+        # Project embedding to spatial features (latent space: 256 channels, 7x7)
         self.projection = nn.Linear(embed_dim, 256 * 7 * 7)
 
         # Transposed convolution layers (reverse of encoder)
+        # This decoder can accept both:
+        # 1. Projected embeddings (from self.projection)
+        # 2. Direct latent features from diffusion model
         self.decoder = nn.Sequential(
             # 7x7 -> 14x14
             nn.ConvTranspose2d(256, 256, kernel_size=4, stride=2, padding=1),
@@ -419,6 +496,15 @@ class ImageDecoder(nn.Module):
         )
 
     def forward(self, embeddings):
+        """
+        Decode from embeddings to images
+
+        Args:
+            embeddings: (batch_size, embed_dim) - vector embeddings
+
+        Returns:
+            images: (batch_size, 3, 224, 224) - generated images
+        """
         # embeddings: (batch_size, embed_dim)
         batch_size = embeddings.size(0)
 
@@ -430,6 +516,38 @@ class ImageDecoder(nn.Module):
         images = self.decoder(features)  # (batch_size, 3, 224, 224)
 
         return images
+
+    def decode_from_latent(self, latents):
+        """
+        Decode from latent features to images
+        (Used by diffusion model - skips the projection step)
+
+        Args:
+            latents: (batch_size, 256, 7, 7) - latent spatial features
+
+        Returns:
+            images: (batch_size, 3, 224, 224) - generated images
+        """
+        # latents: (batch_size, 256, 7, 7)
+        # Directly decode without projection
+        images = self.decoder(latents)  # (batch_size, 3, 224, 224)
+        return images
+
+    def get_latent_from_embedding(self, embeddings):
+        """
+        Convert embeddings to latent features
+        (Used during training to get target latents for diffusion)
+
+        Args:
+            embeddings: (batch_size, embed_dim) - vector embeddings
+
+        Returns:
+            latents: (batch_size, 256, 7, 7) - latent spatial features
+        """
+        batch_size = embeddings.size(0)
+        features = self.projection(embeddings)
+        latents = features.view(batch_size, 256, 7, 7)
+        return latents
 
 
 class TransformerDecoderLayer(nn.Module):
@@ -798,7 +916,7 @@ class MultimodalModel(nn.Module):
 
 
 class GenerativeMultimodalModel(nn.Module):
-    """Generative multimodal model with encoders, decoders, and diffusion"""
+    """Generative multimodal model with encoders, decoders, and latent diffusion"""
 
     def __init__(self, vocab_size, embed_dim=512, use_simple_cnn=True,
                  image_size=224, max_text_length=77, num_diffusion_steps=1000,
@@ -807,6 +925,7 @@ class GenerativeMultimodalModel(nn.Module):
 
         self.embed_dim = embed_dim
         self.vocab_size = vocab_size
+        self.image_size = image_size
 
         # Encoders
         self.image_encoder = ImageEncoder(embed_dim, use_simple_cnn=use_simple_cnn)
@@ -816,8 +935,14 @@ class GenerativeMultimodalModel(nn.Module):
         self.image_decoder = ImageDecoder(embed_dim, image_size)
         self.text_decoder = TextDecoder(vocab_size, embed_dim, max_length=max_text_length)
 
-        # Diffusion model
-        self.diffusion = DiffusionModel(embed_dim, num_timesteps=num_diffusion_steps)
+        # NEW: Latent Diffusion Model for Text-to-Image generation
+        # Operates in the latent space (256 channels, 7x7 spatial) instead of abstract vector space
+        self.latent_diffusion = LatentDiffusionUNet(
+            latent_channels=256,  # Matches ImageDecoder's latent space
+            latent_size=7,  # Matches ImageDecoder's spatial size
+            condition_dim=embed_dim,  # Text embedding dimension
+            num_timesteps=num_diffusion_steps
+        )
 
         # Temperature parameter for contrastive learning
         self.temperature = nn.Parameter(torch.ones([]) * 0.1)
@@ -879,21 +1004,38 @@ class GenerativeMultimodalModel(nn.Module):
 
         return image_recon_loss, text_recon_loss
 
-    def compute_diffusion_loss(self, embeddings):
-        """Compute diffusion loss on embeddings"""
-        batch_size = embeddings.size(0)
-        device = embeddings.device
+    def compute_diffusion_loss(self, image_features, text_features):
+        """
+        Compute diffusion loss on image latent space conditioned on text embeddings
 
-        # Sample random timesteps
-        t = torch.randint(0, self.diffusion.num_timesteps, (batch_size,), device=device)
+        This trains the model to: text_embedding → denoise → image_latent
+        which is used for Text-to-Image generation during inference.
 
-        # Forward diffusion (add noise)
-        noisy_embeddings, noise = self.diffusion.forward_diffusion(embeddings, t)
+        Args:
+            image_features: (B, embed_dim) - image embeddings from encoder
+            text_features: (B, embed_dim) - text embeddings from encoder
 
-        # Predict noise
-        predicted_noise = self.diffusion.predict_noise(noisy_embeddings, t)
+        Returns:
+            diffusion_loss: scalar tensor
+        """
+        batch_size = image_features.size(0)
+        device = image_features.device
 
-        # MSE loss between predicted and actual noise
+        # Step 1: Get target image latents from image embeddings
+        # These are the "ground truth" latents we want to denoise to
+        target_latents = self.image_decoder.get_latent_from_embedding(image_features)  # (B, 256, 7, 7)
+
+        # Step 2: Sample random timesteps for diffusion training
+        t = torch.randint(0, self.latent_diffusion.num_timesteps, (batch_size,), device=device)
+
+        # Step 3: Add noise to target latents (forward diffusion)
+        noisy_latents, noise = self.latent_diffusion.forward_diffusion(target_latents, t)
+
+        # Step 4: Predict noise using UNet conditioned on text embeddings
+        # This is the key: we condition the denoising on text to learn text→image mapping
+        predicted_noise = self.latent_diffusion.predict_noise(noisy_latents, t, condition=text_features)
+
+        # Step 5: MSE loss between predicted and actual noise
         diffusion_loss = nn.MSELoss()(predicted_noise, noise)
 
         return diffusion_loss
@@ -918,9 +1060,9 @@ class GenerativeMultimodalModel(nn.Module):
         )
         recon_loss = (image_recon_loss + text_recon_loss) / 2
 
-        # Diffusion loss (on both image and text embeddings)
-        combined_embeddings = torch.cat([image_features, text_features], dim=0)
-        diffusion_loss = self.compute_diffusion_loss(combined_embeddings)
+        # Diffusion loss (text-conditioned image latent denoising)
+        # This trains: text_embedding → image_latent via denoising
+        diffusion_loss = self.compute_diffusion_loss(image_features, text_features)
 
         # Total loss
         total_loss = (
@@ -940,59 +1082,71 @@ class GenerativeMultimodalModel(nn.Module):
         }
 
     @torch.no_grad()
-    def generate_from_diffusion(self, num_samples, device, mode='both'):
-        """Generate new samples via diffusion
+    def generate_image_from_text(self, text_embeddings, num_inference_steps=50):
+        """
+        Generate images from text embeddings using latent diffusion
+
+        This is the main interface for Text-to-Image generation during inference.
+        Uses the trained latent diffusion model to iteratively denoise image latents
+        conditioned on text embeddings.
 
         Args:
-            num_samples: Number of samples to generate
-            device: Device to generate on
-            mode: 'image', 'text', or 'both'
+            text_embeddings: (B, embed_dim) - text embeddings from text encoder
+            num_inference_steps: Number of denoising steps (10-100)
+                - More steps = better quality but slower
+                - Typical: 20-50 steps for good results
+
+        Returns:
+            images: (B, 3, H, W) - generated images in [0, 1] range
         """
-        # Sample embeddings from diffusion model
-        generated_embeddings = self.diffusion.sample(num_samples, device)
+        batch_size = text_embeddings.size(0)
+        device = text_embeddings.device
 
-        outputs = {}
+        # Step 1: Use latent diffusion to generate image latents conditioned on text
+        # This performs iterative denoising: noise → ... → clean_latent
+        generated_latents = self.latent_diffusion.sample(
+            batch_size=batch_size,
+            device=device,
+            condition=text_embeddings,
+            num_inference_steps=num_inference_steps
+        )  # (B, 256, 7, 7)
 
-        if mode in ['image', 'both']:
-            # Decode to images
-            generated_images = self.image_decoder(generated_embeddings)
-            # Convert from [-1, 1] to [0, 1]
-            generated_images = (generated_images + 1.0) / 2.0
-            outputs['images'] = generated_images
+        # Step 2: Decode latents to images using the image decoder
+        generated_images = self.image_decoder.decode_from_latent(generated_latents)  # (B, 3, 224, 224)
 
-        if mode in ['text', 'both']:
-            # Decode to text
-            generated_text_logits = self.text_decoder(generated_embeddings)
-            generated_tokens = generated_text_logits.argmax(dim=-1)
-            outputs['tokens'] = generated_tokens
+        # Step 3: Convert from [-1, 1] to [0, 1] range
+        generated_images = (generated_images + 1.0) / 2.0
+        generated_images = torch.clamp(generated_images, 0, 1)
 
-        return outputs
+        return generated_images
 
     @torch.no_grad()
-    def cross_modal_generation(self, source, source_type='image'):
-        """Generate one modality from another
+    def generate_text_from_image(self, image_embeddings):
+        """
+        Generate text from image embeddings using autoregressive decoder
+
+        This is the main interface for Image-to-Text generation during inference.
+        Uses the trained text decoder to autoregressively generate text tokens.
 
         Args:
-            source: Input data (images or tokens)
-            source_type: 'image' or 'text'
+            image_embeddings: (B, embed_dim) - image embeddings from image encoder
+
+        Returns:
+            tokens: (B, seq_len) - generated text tokens
         """
-        if source_type == 'image':
-            # Encode image
-            embeddings = self.image_encoder(source)
-            # Decode to text
-            text_logits = self.text_decoder(embeddings)
-            tokens = text_logits.argmax(dim=-1)
-            return tokens
-        elif source_type == 'text':
-            # Encode text
-            embeddings = self.text_encoder(source)
-            # Decode to image
-            images = self.image_decoder(embeddings)
-            # Convert from [-1, 1] to [0, 1]
-            images = (images + 1.0) / 2.0
-            return images
-        else:
-            raise ValueError(f"Unknown source_type: {source_type}")
+        # Text decoder will handle autoregressive generation
+        # Note: This returns logits, need to argmax to get tokens
+        text_logits = self.text_decoder(image_embeddings, target_tokens=None)  # (B, seq_len, vocab_size)
+        tokens = text_logits.argmax(dim=-1)  # (B, seq_len)
+        return tokens
+
+    # DEPRECATED: Old cross_modal_generation had bugs (missing attention_mask)
+    # Use generate_image_from_text() and generate_text_from_image() instead
+    #
+    # @torch.no_grad()
+    # def cross_modal_generation(self, source, source_type='image'):
+    #     """DEPRECATED: Use generate_image_from_text or generate_text_from_image instead"""
+    #     pass
 
 
 class Trainer:
@@ -1035,13 +1189,14 @@ class Trainer:
         logger.info(f"BERT tokenizer loaded (vocab size: {self.tokenizer.vocab_size})")
 
         # Load training dataset with tokenizer
-        self.train_dataset = Flickr30kDataset(
+        self.train_dataset = MultimodalDataset(
             config['data_dir'],
             image_size=config.get('image_size', 224),
             tokenizer=self.tokenizer,
             split='train',
             train_ratio=config.get('train_ratio', 0.9),
-            random_seed=config.get('random_seed', 42)
+            random_seed=config.get('random_seed', 42),
+            dataset_type=config.get('dataset_type', 'auto')
         )
 
         self.train_loader = DataLoader(
@@ -1053,13 +1208,14 @@ class Trainer:
         )
 
         # Load validation dataset
-        self.val_dataset = Flickr30kDataset(
+        self.val_dataset = MultimodalDataset(
             config['data_dir'],
             image_size=config.get('image_size', 224),
             tokenizer=self.tokenizer,
             split='val',
             train_ratio=config.get('train_ratio', 0.9),
-            random_seed=config.get('random_seed', 42)
+            random_seed=config.get('random_seed', 42),
+            dataset_type=config.get('dataset_type', 'auto')
         )
 
         self.val_loader = DataLoader(
@@ -1466,46 +1622,47 @@ class Trainer:
 def main():
     """Main function"""
     config = {
-        # Data
-        'data_dir': 'data/flickr30k',
+        # Data - Use MS COCO (330K images) for better results
+        'data_dir': 'data/coco/coco2017',  # Point to coco2017 subdirectory
+        'dataset_type': 'auto',   # Auto-detect dataset type
         'output_dir': 'outputs',
 
-        # Model - increased capacity
+        # Model - optimized for image-text generation
         'vocab_size': 10000,
-        'embed_dim': 512,  # 256 -> 512 for better representation
+        'embed_dim': 512,
         'image_size': 224,
         'max_text_length': 77,
         'use_simple_cnn': True,
 
-        # BERT
+        # BERT - CRITICAL: Must unfreeze for training to work!
         'bert_model_name': 'bert-base-uncased',
         'cache_dir': './models/bert_cache',
-        'freeze_bert': True,  # Freeze BERT for faster training
+        'freeze_bert': False,  # CHANGED: Unfreeze BERT to enable learning
 
-        # Generative model
+        # Generative model - balanced weights for image-text generation
         'use_generative': True,
         'num_diffusion_steps': 1000,
-        'contrastive_weight': 0.5,  # Reduced from 1.0
-        'recon_weight': 1.5,        # Increased from 0.5 - reconstruction is key
-        'diffusion_weight': 0.3,
+        'contrastive_weight': 1.0,   # CHANGED: Alignment is critical
+        'recon_weight': 0.5,          # CHANGED: Reconstruction for generation
+        'diffusion_weight': 0.1,      # CHANGED: Reduce diffusion weight
 
         # Dataset split
         'train_ratio': 0.9,
         'random_seed': 42,
 
-        # Training
-        'num_epochs': 30,  # Increased for better convergence
-        'batch_size': 32,
-        'num_workers': 4,
+        # Training - adjusted for BERT fine-tuning
+        'num_epochs': 15,
+        'batch_size': 64,
+        'num_workers': 8,
 
-        # Optimizer
+        # Optimizer - Lower LR for BERT fine-tuning
         'optimizer': 'adamw',
-        'learning_rate': 1e-4,  # Lower LR for stability
+        'learning_rate': 2e-4,  # CHANGED: Lower LR for stable BERT fine-tuning
         'weight_decay': 0.01,
 
-        # Learning rate scheduler
-        'scheduler': 'cosine',  # Cosine annealing
-        'warmup_epochs': 2,
+        # Learning rate scheduler - with warmup for BERT
+        'scheduler': 'cosine',
+        'warmup_epochs': 2,     # CHANGED: Add warmup for BERT
         'min_lr': 1e-7,
 
         # Save

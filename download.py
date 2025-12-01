@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 import kagglehub
+import argparse
 
 # 加载环境变量
 load_dotenv()
@@ -19,16 +20,44 @@ data_dir = Path(__file__).parent / "data"
 data_dir.mkdir(exist_ok=True)
 print(f"[OK] Data directory: {data_dir}")
 
-# 下载 Flickr30k 数据集
-# Flickr30k 在 Kaggle 上的常见数据集路径
-dataset_name = "hsankesara/flickr-image-dataset"
+# 数据集配置
+DATASETS = {
+    'flickr30k': {
+        'name': 'hsankesara/flickr-image-dataset',
+        'size': '~30K images',
+        'symlink': 'flickr30k'
+    },
+    'coco': {
+        'name': 'awsaf49/coco-2017-dataset',
+        'size': '~330K images (train+val)',
+        'symlink': 'coco'
+    },
+    'conceptual_captions': {
+        'name': 'google-research-datasets/conceptual-captions',
+        'size': '~3.3M images',
+        'symlink': 'conceptual_captions'
+    }
+}
 
-print(f"\nStarting download of {dataset_name}...")
+# 参数解析
+parser = argparse.ArgumentParser(description='Download image-text datasets')
+parser.add_argument('--dataset', type=str, default='coco',
+                   choices=list(DATASETS.keys()),
+                   help='Dataset to download (default: coco)')
+args = parser.parse_args()
+
+dataset_config = DATASETS[args.dataset]
+dataset_name = dataset_config['name']
+
+print(f"\n{'='*70}")
+print(f"Downloading: {args.dataset.upper()}")
+print(f"Dataset: {dataset_name}")
+print(f"Size: {dataset_config['size']}")
+print(f"{'='*70}\n")
 print("This may take a while, please be patient...\n")
 
 try:
     # 使用 kagglehub 下载数据集
-    # 默认会下载到缓存目录,然后我们可以移动或链接到 data 目录
     path = kagglehub.dataset_download(dataset_name)
 
     print(f"\n[OK] Dataset downloaded successfully!")
@@ -36,11 +65,24 @@ try:
     print(f"\nNote: Data has been downloaded to kagglehub cache directory")
     print(f"You can use this path in your code, or create a symlink to {data_dir}")
 
-    # 可选: 创建符号链接到 data 目录
-    symlink_path = data_dir / "flickr30k"
-    if not symlink_path.exists():
+    # 创建符号链接到 data 目录
+    symlink_path = data_dir / dataset_config['symlink']
+    if symlink_path.exists():
+        if symlink_path.is_symlink():
+            symlink_path.unlink()
+        else:
+            print(f"[WARNING] {symlink_path} exists and is not a symlink, skipping...")
+            symlink_path = None
+
+    if symlink_path:
         symlink_path.symlink_to(path)
         print(f"[OK] Created symlink: {symlink_path} -> {path}")
+
+    # 显示数据集信息
+    print(f"\n{'='*70}")
+    print(f"Dataset ready!")
+    print(f"Path: {symlink_path or path}")
+    print(f"{'='*70}\n")
 
 except Exception as e:
     print(f"\n[ERROR] Download failed: {str(e)}")
@@ -48,7 +90,10 @@ except Exception as e:
     print("1. Incorrect dataset name")
     print("2. Invalid Kaggle API token")
     print("3. Network connection issues")
-    print("\nPlease visit https://www.kaggle.com/datasets and search for flickr30k to confirm the correct dataset name")
+    print("4. Dataset not available on Kaggle")
+    print(f"\nPlease visit https://www.kaggle.com/datasets and search for {args.dataset}")
     raise
 
 print("\nDone!")
+print(f"\nTo use this dataset, update main.py config:")
+print(f"  'data_dir': 'data/{dataset_config['symlink']}',")

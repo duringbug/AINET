@@ -114,19 +114,22 @@ class ImageToTextGenerator:
         ])
 
     @torch.no_grad()
-    def generate_from_image(self, image_paths, num_captions_per_image=3, use_diffusion=False,
-                           num_inference_steps=50, seed=None, temperature=1.0,
+    def generate_from_image(self, image_paths, num_captions_per_image=3,
+                           seed=None, temperature=1.0,
                            top_k=50, top_p=0.9, repetition_penalty=1.2):
         """
-        Generate text descriptions from images with improved decoding
+        Generate text descriptions from images using autoregressive decoding
+
+        Image-to-Text generation uses Transformer autoregressive decoding,
+        NOT diffusion (diffusion is only for Text-to-Image).
 
         Args:
             image_paths: List of image paths or single path
             num_captions_per_image: Number of different captions to generate per image
-            use_diffusion: If True, use diffusion to refine embeddings (slower but potentially better)
-            num_inference_steps: Number of diffusion steps if use_diffusion=True
             seed: Random seed for reproducibility (None = random)
             temperature: Sampling temperature (higher = more random, lower = more deterministic)
+                - 0.7-0.8: More focused, coherent captions
+                - 0.9-1.0: More diverse captions
             top_k: Keep only top k tokens for sampling (0 = disabled)
             top_p: Nucleus sampling probability (0-1, closer to 1 = more diverse)
             repetition_penalty: Penalty for repeating tokens (>1 discourages repetition)
@@ -163,25 +166,15 @@ class ImageToTextGenerator:
                 if seed is not None:
                     torch.manual_seed(seed + i)
 
+                logger.info(f"  Generating caption {i+1}/{num_captions_per_image}")
+
                 # Encode image to embedding space
                 image_embedding = self.model.image_encoder(image_tensor)
 
-                if use_diffusion:
-                    # Use diffusion to potentially improve the embedding
-                    logger.info(f"  Generating caption {i+1}/{num_captions_per_image} (with diffusion, steps={num_inference_steps})")
-                    refined_embedding = self.model.diffusion.sample(
-                        batch_size=1,
-                        device=self.device,
-                        condition=image_embedding,
-                        num_inference_steps=num_inference_steps
-                    )
-                else:
-                    logger.info(f"  Generating caption {i+1}/{num_captions_per_image} (direct decoding)")
-                    refined_embedding = image_embedding
-
-                # Use improved autoregressive decoding with sampling
+                # Generate tokens using autoregressive decoding with sampling
+                # No diffusion needed - Transformer handles text generation well
                 predicted_tokens = self.generate_tokens_with_sampling(
-                    refined_embedding,
+                    image_embedding,
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
@@ -195,8 +188,7 @@ class ImageToTextGenerator:
                     'image_path': str(img_path),
                     'caption': caption,
                     'tokens': predicted_tokens.cpu().tolist(),
-                    'sample_id': i,
-                    'use_diffusion': use_diffusion
+                    'sample_id': i
                 })
 
                 logger.info(f"    Caption: {caption}")
@@ -416,13 +408,12 @@ def main():
     # Try different decoding strategies for better quality
     all_results = []
 
-    # Method 1: Direct decoding with sampling (diverse results)
-    logger.info("\n--- Method 1: Direct Decoding with Sampling (Diverse) ---\n")
+    # Method 1: Sampling with diversity (more random, creative captions)
+    logger.info("\n--- Method 1: Diverse Sampling (Higher Temperature) ---\n")
     results_sampling = generator.generate_from_image(
         image_files,
         num_captions_per_image=3,  # Generate 3 different captions
-        use_diffusion=False,
-        temperature=0.9,  # Slightly random for diversity
+        temperature=0.9,  # Higher temperature for diversity
         top_k=50,  # Top-k sampling
         top_p=0.9,  # Nucleus sampling
         repetition_penalty=1.3,  # Strong penalty against repetition
@@ -430,12 +421,11 @@ def main():
     )
     all_results.extend(results_sampling)
 
-    # Method 2: Direct decoding with lower temperature (more focused)
-    logger.info("\n--- Method 2: Direct Decoding (More Focused) ---\n")
+    # Method 2: Focused sampling (more deterministic, coherent captions)
+    logger.info("\n--- Method 2: Focused Sampling (Lower Temperature) ---\n")
     results_focused = generator.generate_from_image(
         image_files,
         num_captions_per_image=2,  # Generate 2 captions
-        use_diffusion=False,
         temperature=0.7,  # Lower temperature for more focused results
         top_k=30,
         top_p=0.85,
