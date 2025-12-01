@@ -36,9 +36,25 @@ try:
     print(f"\nNote: Data has been downloaded to kagglehub cache directory")
     print(f"You can use this path in your code, or create a symlink to {data_dir}")
 
-    # 可选: 创建符号链接到 data 目录
+    # 创建或更新符号链接到 data 目录
     symlink_path = data_dir / "flickr30k"
-    if not symlink_path.exists():
+
+    # 如果符号链接已存在，检查它是否有效
+    if symlink_path.exists() or symlink_path.is_symlink():
+        if symlink_path.is_symlink():
+            # 如果是符号链接，检查目标是否相同
+            if symlink_path.resolve() == Path(path).resolve():
+                print(f"[OK] Symlink already exists and points to correct location: {symlink_path} -> {path}")
+            else:
+                # 更新符号链接到新位置
+                symlink_path.unlink()
+                symlink_path.symlink_to(path)
+                print(f"[OK] Updated symlink: {symlink_path} -> {path}")
+        else:
+            # 如果是普通目录或文件，警告用户
+            print(f"[WARNING] {symlink_path} already exists as a regular file/directory, not creating symlink")
+    else:
+        # 创建新的符号链接
         symlink_path.symlink_to(path)
         print(f"[OK] Created symlink: {symlink_path} -> {path}")
 

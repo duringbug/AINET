@@ -86,23 +86,33 @@ class Flickr30kDataset(Dataset):
         self.train_ratio = train_ratio
         self.random_seed = random_seed
 
-        # Find image directory
+        # Find image directory - search recursively to handle nested directories
+        self.image_dir = None
+
+        # First, try common known paths
         possible_image_dirs = [
+            self.data_dir,  # Direct path (for when symlink points directly to images)
             self.data_dir / 'flickr30k_images' / 'flickr30k_images',
             self.data_dir / 'flickr30k_images',
             self.data_dir / 'Images',
             self.data_dir / 'images',
         ]
 
-        self.image_dir = None
         for img_dir in possible_image_dirs:
-            if img_dir.exists():
+            if img_dir.exists() and self._has_image_files(img_dir):
                 self.image_dir = img_dir
                 logger.info(f"Found image directory: {img_dir}")
                 break
 
+        # If not found, search recursively for directories with images
+        if self.image_dir is None:
+            logger.info(f"Searching recursively for image directory in {self.data_dir}...")
+            self.image_dir = self._find_image_directory_recursive(self.data_dir, max_depth=5)
+
         if self.image_dir is None:
             raise ValueError(f"Image directory not found in {self.data_dir}")
+
+        logger.info(f"Using image directory: {self.image_dir}")
 
         # Load captions
         all_captions = self._load_captions()
@@ -143,11 +153,41 @@ class Flickr30kDataset(Dataset):
 
         logger.info(f"Dataset initialized with {len(self.captions)} samples")
 
+    def _has_image_files(self, directory, min_images=10):
+        """Check if directory contains image files"""
+        try:
+            image_files = list(directory.glob('*.jpg')) + list(directory.glob('*.png'))
+            return len(image_files) >= min_images
+        except:
+            return False
+
+    def _find_image_directory_recursive(self, root_dir, max_depth=5, current_depth=0):
+        """Recursively search for directory containing image files"""
+        if current_depth > max_depth:
+            return None
+
+        try:
+            # Check if current directory has images
+            if self._has_image_files(root_dir, min_images=100):
+                return root_dir
+
+            # Search subdirectories
+            for subdir in root_dir.iterdir():
+                if subdir.is_dir():
+                    result = self._find_image_directory_recursive(subdir, max_depth, current_depth + 1)
+                    if result is not None:
+                        return result
+        except:
+            pass
+
+        return None
+
     def _load_captions(self):
         """Load image captions"""
         # Try multiple possible locations for caption files
         caption_files = [
             self.data_dir / 'results.csv',
+            self.data_dir / '..' / 'results.csv',  # Parent directory
             self.data_dir / 'flickr30k_images' / 'results.csv',
             self.data_dir / 'captions.txt',
             self.data_dir / 'flickr30k_images' / 'captions.txt',
