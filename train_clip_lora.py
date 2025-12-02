@@ -26,6 +26,7 @@ import numpy as np
 from tqdm import tqdm
 import logging
 from pathlib import Path
+import time
 
 # Import from main.py for Flickr30k dataset (same as step2.py)
 # This ensures we use the same image-text pairing mechanism
@@ -181,17 +182,18 @@ class CLIPLoRATrainer:
     def compute_clip_loss(self, image_features, text_features, logit_scale):
         """
         Compute contrastive loss for CLIP with numerical stability checks
+        Returns: (loss, logits_per_image) for accuracy computation
         """
         # Check for NaN or Inf in features before normalization
         if torch.isnan(image_features).any() or torch.isinf(image_features).any():
             logger.error(f"NaN or Inf detected in image_features before normalization!")
             logger.error(f"image_features stats - min: {image_features.min()}, max: {image_features.max()}, mean: {image_features.mean()}")
-            return torch.tensor(float('nan'), device=self.device, requires_grad=True)
+            return torch.tensor(float('nan'), device=self.device, requires_grad=True), None
 
         if torch.isnan(text_features).any() or torch.isinf(text_features).any():
             logger.error(f"NaN or Inf detected in text_features before normalization!")
             logger.error(f"text_features stats - min: {text_features.min()}, max: {text_features.max()}, mean: {text_features.mean()}")
-            return torch.tensor(float('nan'), device=self.device, requires_grad=True)
+            return torch.tensor(float('nan'), device=self.device, requires_grad=True), None
 
         # Normalize features with eps for numerical stability
         image_features = F.normalize(image_features, dim=-1, eps=1e-6)
@@ -200,11 +202,11 @@ class CLIPLoRATrainer:
         # Check for NaN or Inf after normalization
         if torch.isnan(image_features).any() or torch.isinf(image_features).any():
             logger.error(f"NaN or Inf detected in image_features after normalization!")
-            return torch.tensor(float('nan'), device=self.device, requires_grad=True)
+            return torch.tensor(float('nan'), device=self.device, requires_grad=True), None
 
         if torch.isnan(text_features).any() or torch.isinf(text_features).any():
             logger.error(f"NaN or Inf detected in text_features after normalization!")
-            return torch.tensor(float('nan'), device=self.device, requires_grad=True)
+            return torch.tensor(float('nan'), device=self.device, requires_grad=True), None
 
         # Clamp logit_scale to prevent overflow (max ~4.6 corresponds to scale ~100)
         logit_scale = torch.clamp(logit_scale, max=4.6052)  # log(100)
@@ -216,7 +218,7 @@ class CLIPLoRATrainer:
         # Check logits for NaN or Inf
         if torch.isnan(logits_per_image).any() or torch.isinf(logits_per_image).any():
             logger.error(f"NaN or Inf detected in logits! logit_scale: {logit_scale.item()}")
-            return torch.tensor(float('nan'), device=self.device, requires_grad=True)
+            return torch.tensor(float('nan'), device=self.device, requires_grad=True), None
 
         # Labels: diagonal is positive pairs
         batch_size = image_features.shape[0]
@@ -231,20 +233,123 @@ class CLIPLoRATrainer:
         if torch.isnan(loss) or torch.isinf(loss):
             logger.error(f"NaN or Inf detected in final loss!")
             logger.error(f"loss_img: {loss_img.item()}, loss_txt: {loss_txt.item()}")
-            return torch.tensor(float('nan'), device=self.device, requires_grad=True)
+            return torch.tensor(float('nan'), device=self.device, requires_grad=True), None
 
-        return loss
+        return loss, logits_per_image
+
+    def compute_accuracy(self, logits):
+        """
+        Compute retrieval accuracy (same as main.py)
+        Args:
+            logits: (batch_size, batch_size) similarity matrix
+        Returns:
+            dict with i2t_top1, i2t_top5, t2i_top1, t2i_top5
+        """
+        batch_size = logits.size(0)
+        labels = torch.arange(batch_size, device=logits.device)
+
+        # Adjust k for top-k based on batch size
+        k = min(5, batch_size)
+
+        # Image to text retrieval (top-1 and top-k)
+        _, i2t_pred = logits.topk(k, dim=1)
+        i2t_top1 = (i2t_pred[:, 0] == labels).float().mean().item()
+        i2t_topk = (i2t_pred == labels.unsqueeze(1)).any(dim=1).float().mean().item()
+
+        # Text to image retrieval (top-1 and top-k)
+        _, t2i_pred = logits.t().topk(k, dim=1)
+        t2i_top1 = (t2i_pred[:, 0] == labels).float().mean().item()
+        t2i_topk = (t2i_pred == labels.unsqueeze(1)).any(dim=1).float().mean().item()
+
+        return {
+            'i2t_top1': i2t_top1,
+            'i2t_top5': i2t_topk,
+            't2i_top1': t2i_top1,
+            't2i_top5': t2i_topk,
+            'avg_top1': (i2t_top1 + t2i_top1) / 2,
+            'avg_top5': (i2t_topk + t2i_topk) / 2
+        }
+
+    @torch.no_grad()
+    def evaluate(self, val_loader):
+        """
+        Evaluate model on validation set
+        """
+        self.model.eval()
+        total_loss = 0
+        total_samples = 0
+
+        # Accuracy accumulators
+        total_i2t_top1 = 0
+        total_i2t_top5 = 0
+        total_t2i_top1 = 0
+        total_t2i_top5 = 0
+
+        pbar = tqdm(val_loader, desc='Validating', ncols=120)
+
+        for batch in pbar:
+            images = batch['image'].to(self.device)
+            captions = batch['caption']
+
+            # Check input images for NaN or Inf
+            if torch.isnan(images).any() or torch.isinf(images).any():
+                logger.warning(f"Skipping batch with NaN/Inf in images during validation")
+                continue
+
+            # Tokenize text using CLIP's tokenizer
+            text_tokens = clip.tokenize(captions, truncate=True).to(self.device)
+
+            # Forward pass
+            image_features = self.model.encode_image(images)
+            text_features = self.model.encode_text(text_tokens)
+
+            # Compute loss
+            logit_scale = self.model.logit_scale.exp()
+            loss, logits = self.compute_clip_loss(image_features, text_features, logit_scale)
+
+            if logits is None:
+                continue
+
+            # Compute accuracy
+            accuracy = self.compute_accuracy(logits)
+            total_i2t_top1 += accuracy['i2t_top1']
+            total_i2t_top5 += accuracy['i2t_top5']
+            total_t2i_top1 += accuracy['t2i_top1']
+            total_t2i_top5 += accuracy['t2i_top5']
+
+            total_loss += loss.item()
+            total_samples += 1
+
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+        # Calculate validation metrics
+        num_batches = len(val_loader)
+        val_metrics = {
+            'val_loss': total_loss / num_batches,
+            'val_i2t_top1': total_i2t_top1 / num_batches,
+            'val_i2t_top5': total_i2t_top5 / num_batches,
+            'val_t2i_top1': total_t2i_top1 / num_batches,
+            'val_t2i_top5': total_t2i_top5 / num_batches,
+        }
+
+        logger.info(f"Validation Results:")
+        logger.info(f"  Loss: {val_metrics['val_loss']:.4f}")
+        logger.info(f"  Image->Text: Top-1={val_metrics['val_i2t_top1']*100:.2f}%, Top-5={val_metrics['val_i2t_top5']*100:.2f}%")
+        logger.info(f"  Text->Image: Top-1={val_metrics['val_t2i_top1']*100:.2f}%, Top-5={val_metrics['val_t2i_top5']*100:.2f}%")
+
+        return val_metrics
 
     def train(
         self,
         train_loader,
+        val_loader=None,
         num_epochs=10,
         learning_rate=1e-4,
         save_dir='outputs/clip_lora',
         save_freq=5
     ):
         """
-        Train CLIP with LoRA
+        Train CLIP with LoRA (with validation support like main.py)
         """
         save_dir = Path(save_dir)
         save_dir.mkdir(exist_ok=True, parents=True)
@@ -257,16 +362,42 @@ class CLIPLoRATrainer:
             betas=(0.9, 0.999),
             eps=1e-8  # Increase epsilon for numerical stability
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+
+        # Learning rate scheduler (ReduceLROnPlateau like main.py)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.5,
+            patience=3,
+            min_lr=1e-7
+        )
 
         logger.info(f'Starting training for {num_epochs} epochs...')
         logger.info(f'Total batches per epoch: {len(train_loader)}')
+        if val_loader:
+            logger.info(f'Validation batches per epoch: {len(val_loader)}')
+
+        best_val_loss = float('inf')
+        best_val_acc = 0.0
 
         for epoch in range(num_epochs):
             self.model.train()
             total_loss = 0
+            epoch_start_time = time.time()
 
-            pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
+            # Accuracy accumulators for training
+            total_i2t_top1 = 0
+            total_i2t_top5 = 0
+            total_t2i_top1 = 0
+            total_t2i_top5 = 0
+
+            pbar = tqdm(
+                train_loader,
+                desc=f'Epoch {epoch+1}/{num_epochs}',
+                ncols=150
+            )
+
+            batch_start_time = time.time()
 
             for batch_idx, batch in enumerate(pbar):
                 # Get images and captions from batch dict (same as step2.py)
@@ -297,9 +428,19 @@ class CLIPLoRATrainer:
 
                 text_features = self.model.encode_text(text_tokens)
 
-                # Compute loss
+                # Compute loss and logits
                 logit_scale = self.model.logit_scale.exp()
-                loss = self.compute_clip_loss(image_features, text_features, logit_scale)
+                loss, logits = self.compute_clip_loss(image_features, text_features, logit_scale)
+
+                if logits is None:
+                    continue
+
+                # Compute accuracy
+                accuracy = self.compute_accuracy(logits)
+                total_i2t_top1 += accuracy['i2t_top1']
+                total_i2t_top5 += accuracy['i2t_top5']
+                total_t2i_top1 += accuracy['t2i_top1']
+                total_t2i_top5 += accuracy['t2i_top5']
 
                 # Backward pass
                 optimizer.zero_grad()
@@ -335,17 +476,111 @@ class CLIPLoRATrainer:
                 optimizer.step()
 
                 total_loss += loss.item()
+
+                # Calculate speed and ETA (like main.py)
+                batch_time = time.time() - batch_start_time
+                batch_size = images.size(0)
+                samples_per_sec = batch_size / batch_time if batch_time > 0 else 0
+
+                batches_done = batch_idx + 1
+                batches_left = len(train_loader) - batches_done
+                eta_seconds = batches_left * (time.time() - epoch_start_time) / batches_done
+                eta_min = int(eta_seconds // 60)
+                eta_sec = int(eta_seconds % 60)
+
+                # Update progress bar with detailed info
                 pbar.set_postfix({
                     'loss': f'{loss.item():.4f}',
-                    'grad_norm': f'{grad_norm:.3f}',
-                    'max_grad': f'{max_grad:.2f}',
-                    'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'
+                    'avg_loss': f'{total_loss/batches_done:.4f}',
+                    'i2t': f'{accuracy["i2t_top1"]*100:.1f}%',
+                    't2i': f'{accuracy["t2i_top1"]*100:.1f}%',
+                    'lr': f'{optimizer.param_groups[0]["lr"]:.2e}',
+                    'speed': f'{samples_per_sec:.1f}s/s',
+                    'ETA': f'{eta_min:02d}:{eta_sec:02d}'
                 })
 
-            avg_loss = total_loss / len(train_loader)
-            logger.info(f'Epoch {epoch+1}/{num_epochs} - Average Loss: {avg_loss:.4f}')
+                batch_start_time = time.time()
 
-            scheduler.step()
+            # Calculate epoch metrics
+            num_batches = len(train_loader)
+            avg_loss = total_loss / num_batches
+            avg_i2t_top1 = total_i2t_top1 / num_batches
+            avg_i2t_top5 = total_i2t_top5 / num_batches
+            avg_t2i_top1 = total_t2i_top1 / num_batches
+            avg_t2i_top5 = total_t2i_top5 / num_batches
+
+            # Print separator for clarity
+            logger.info('')
+            logger.info('='*80)
+            logger.info(f'EPOCH {epoch+1}/{num_epochs} SUMMARY')
+            logger.info('='*80)
+
+            logger.info(f'\n[Training Results]')
+            logger.info(f'  Loss: {avg_loss:.4f}')
+            logger.info(f'  Image->Text: Top-1={avg_i2t_top1*100:.2f}%, Top-5={avg_i2t_top5*100:.2f}%')
+            logger.info(f'  Text->Image: Top-1={avg_t2i_top1*100:.2f}%, Top-5={avg_t2i_top5*100:.2f}%')
+            logger.info(f'  Average Accuracy: Top-1={(avg_i2t_top1+avg_t2i_top1)/2*100:.2f}%')
+
+            # Validation - 每个epoch都运行
+            if val_loader:
+                logger.info(f'\n[Validation Results]')
+                val_metrics = self.evaluate(val_loader)
+                val_loss = val_metrics['val_loss']
+
+                logger.info(f'  Loss: {val_loss:.4f} (Δ {val_loss-avg_loss:+.4f} vs train)')
+                logger.info(f'  Image->Text: Top-1={val_metrics["val_i2t_top1"]*100:.2f}%, Top-5={val_metrics["val_i2t_top5"]*100:.2f}%')
+                logger.info(f'  Text->Image: Top-1={val_metrics["val_t2i_top1"]*100:.2f}%, Top-5={val_metrics["val_t2i_top5"]*100:.2f}%')
+                val_avg_acc = (val_metrics['val_i2t_top1'] + val_metrics['val_t2i_top1']) / 2
+                logger.info(f'  Average Accuracy: Top-1={val_avg_acc*100:.2f}%')
+
+                # Update scheduler based on validation loss
+                old_lr = optimizer.param_groups[0]['lr']
+                scheduler.step(val_loss)
+                new_lr = optimizer.param_groups[0]['lr']
+
+                # Log learning rate changes
+                logger.info(f'\n[Training Info]')
+                if new_lr < old_lr:
+                    logger.info(f'  Learning rate: {old_lr:.2e} -> {new_lr:.2e} (REDUCED)')
+                else:
+                    logger.info(f'  Learning rate: {new_lr:.2e}')
+
+                # Save best model based on validation loss
+                if val_loss < best_val_loss:
+                    improvement = best_val_loss - val_loss
+                    best_val_loss = val_loss
+                    best_checkpoint_path = save_dir / 'clip_lora_best.pt'
+                    self.save_checkpoint(best_checkpoint_path, epoch + 1, optimizer, scheduler, val_loss)
+                    logger.info(f'  ⭐ NEW BEST MODEL! Val loss improved by {improvement:.4f}')
+                    logger.info(f'  Saved to: {best_checkpoint_path}')
+                else:
+                    logger.info(f'  Best val loss so far: {best_val_loss:.4f} (current: {val_loss:.4f})')
+
+                # Also track best accuracy
+                if val_avg_acc > best_val_acc:
+                    best_val_acc = val_avg_acc
+                    logger.info(f'  ⭐ NEW BEST ACCURACY! {val_avg_acc*100:.2f}%')
+                else:
+                    logger.info(f'  Best accuracy so far: {best_val_acc*100:.2f}%')
+
+                # Performance summary table
+                logger.info(f'\n[Performance Comparison]')
+                logger.info(f'  {"Metric":<25} {"Train":>12} {"Validation":>12} {"Difference":>12}')
+                logger.info(f'  {"-"*25} {"-"*12} {"-"*12} {"-"*12}')
+                logger.info(f'  {"Loss":<25} {avg_loss:>12.4f} {val_loss:>12.4f} {val_loss-avg_loss:>+12.4f}')
+                logger.info(f'  {"I2T Top-1":<25} {avg_i2t_top1*100:>11.2f}% {val_metrics["val_i2t_top1"]*100:>11.2f}% {(val_metrics["val_i2t_top1"]-avg_i2t_top1)*100:>+11.2f}%')
+                logger.info(f'  {"T2I Top-1":<25} {avg_t2i_top1*100:>11.2f}% {val_metrics["val_t2i_top1"]*100:>11.2f}% {(val_metrics["val_t2i_top1"]-avg_t2i_top1)*100:>+11.2f}%')
+                logger.info(f'  {"Average Top-1":<25} {(avg_i2t_top1+avg_t2i_top1)/2*100:>11.2f}% {val_avg_acc*100:>11.2f}% {(val_avg_acc-(avg_i2t_top1+avg_t2i_top1)/2)*100:>+11.2f}%')
+
+            else:
+                # No validation, just update scheduler
+                logger.info(f'\n[Training Info]')
+                logger.info(f'  No validation set provided')
+                scheduler.step(avg_loss)
+                logger.info(f'  Learning rate: {optimizer.param_groups[0]["lr"]:.2e}')
+
+            logger.info('='*80)
+            logger.info('')
 
             # Save checkpoint
             if (epoch + 1) % save_freq == 0 or (epoch + 1) == num_epochs:
@@ -512,7 +747,19 @@ def main():
     # Load training dataset with tokenizer (same as step2.py)
     logger.info(f'Loading dataset from {config["data_dir"]}...')
 
+    # CLIP transform (same for train and val)
+    clip_transform = transforms.Compose([
+        transforms.Resize(config['image_size'], interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(config['image_size']),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.48145466, 0.4578275, 0.40821073],  # CLIP normalization
+            std=[0.26862954, 0.26130258, 0.27577711]
+        )
+    ])
+
     try:
+        # Training dataset
         train_dataset = Flickr30kDataset(
             config['data_dir'],
             image_size=config['image_size'],
@@ -520,20 +767,21 @@ def main():
             split='train',
             train_ratio=config['train_ratio']
         )
-
-        # Override the transform to use CLIP's normalization instead of ImageNet
-        clip_transform = transforms.Compose([
-            transforms.Resize(config['image_size'], interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(config['image_size']),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.48145466, 0.4578275, 0.40821073],  # CLIP normalization
-                std=[0.26862954, 0.26130258, 0.27577711]
-            )
-        ])
         train_dataset.transform = clip_transform
-        logger.info('Applied CLIP-specific image transforms')
+        logger.info('Applied CLIP-specific image transforms to training set')
 
+        # Validation dataset
+        val_dataset = Flickr30kDataset(
+            config['data_dir'],
+            image_size=config['image_size'],
+            tokenizer=tokenizer,
+            split='val',
+            train_ratio=config['train_ratio']
+        )
+        val_dataset.transform = clip_transform
+        logger.info('Applied CLIP-specific image transforms to validation set')
+
+        # DataLoaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=config['batch_size'],
@@ -543,8 +791,19 @@ def main():
             drop_last=True
         )
 
-        logger.info(f'Dataset size: {len(train_dataset)}')
-        logger.info(f'Number of batches: {len(train_loader)}')
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config['batch_size'],
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True if device.type == 'cuda' else False,
+            drop_last=False
+        )
+
+        logger.info(f'Training dataset size: {len(train_dataset)}')
+        logger.info(f'Validation dataset size: {len(val_dataset)}')
+        logger.info(f'Training batches: {len(train_loader)}')
+        logger.info(f'Validation batches: {len(val_loader)}')
 
     except Exception as e:
         logger.error(f'Failed to load dataset: {e}')
@@ -565,6 +824,7 @@ def main():
     logger.info('Starting training...')
     trainer.train(
         train_loader=train_loader,
+        val_loader=val_loader,  # 添加验证集
         num_epochs=config['num_epochs'],
         learning_rate=config['learning_rate'],
         save_dir=config['save_dir'],
@@ -572,6 +832,7 @@ def main():
     )
 
     logger.info('Training completed!')
+    logger.info(f'Best validation loss: {trainer.best_loss:.4f}' if hasattr(trainer, 'best_loss') else '')
 
 
 def test_clip_lora(
