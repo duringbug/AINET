@@ -79,14 +79,10 @@ class CrossAttention(nn.Module):
         k = k.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Use scaled_dot_product_attention if available (more memory efficient)
-        if hasattr(F, 'scaled_dot_product_attention'):
-            out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
-        else:
-            # Fallback to manual attention
-            attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-            attn = F.softmax(attn, dim=-1)
-            out = torch.matmul(attn, v)
+        # Manual attention (more stable)
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)
 
         # Reshape back
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.query_dim)
@@ -121,7 +117,6 @@ class ConditionedBlock(nn.Module):
             context_dim=text_emb_dim,
             num_heads=min(4, max(1, out_channels // 32))  # Reduced for memory efficiency
         )
-        self.text_norm = nn.GroupNorm(groups, out_channels)
 
         # Residual connection
         if in_channels != out_channels:
@@ -136,13 +131,15 @@ class ConditionedBlock(nn.Module):
             time_emb: (batch_size, time_emb_dim)
             text_context: (batch_size, text_seq_len, text_emb_dim)
         """
+        residual = self.residual_conv(x)
+
         # First conv
         h = self.conv1(x)
         h = self.norm1(h)
 
         # Add time embedding
-        time_emb = self.time_mlp(time_emb)
-        h = h + time_emb[:, :, None, None]
+        time_emb_projected = self.time_mlp(time_emb)
+        h = h + time_emb_projected[:, :, None, None]
         h = F.silu(h)
 
         # Second conv
@@ -160,11 +157,12 @@ class ConditionedBlock(nn.Module):
 
         # Reshape back (B, H*W, C) -> (B, C, H, W)
         h_attn = h_attn.transpose(1, 2).view(batch_size, channels, height, width)
+
+        # Add attention to main path
         h = h + h_attn
-        h = self.text_norm(h)
 
         # Residual connection
-        return h + self.residual_conv(x)
+        return h + residual
 
 
 class TextConditionedUNet(nn.Module):
@@ -467,6 +465,8 @@ def train_text_conditioned_ddpm(
     ddpm,
     text_encoder,
     train_loader,
+    tokenizer,
+    config,
     num_epochs=100,
     learning_rate=2e-4,
     save_dir='outputs/text_conditioned_ddpm',
@@ -632,6 +632,13 @@ def train_text_conditioned_ddpm(
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'loss': avg_loss,
+            'config': config,
+            'tokenizer': {
+                'word2idx': tokenizer.word2idx,
+                'idx2word': tokenizer.idx2word,
+                'vocab_size': tokenizer.vocab_size,
+                'max_length': tokenizer.max_length
+            }
         }, checkpoint_path)
         logger.info(f'Checkpoint saved to {checkpoint_path}')
 
@@ -639,6 +646,13 @@ def train_text_conditioned_ddpm(
     torch.save({
         'model_state_dict': ddpm.model.state_dict(),
         'text_encoder_state_dict': text_encoder.state_dict(),
+        'config': config,
+        'tokenizer': {
+            'word2idx': tokenizer.word2idx,
+            'idx2word': tokenizer.idx2word,
+            'vocab_size': tokenizer.vocab_size,
+            'max_length': tokenizer.max_length
+        }
     }, final_path)
     logger.info(f'Final model saved to {final_path}')
 
@@ -651,8 +665,8 @@ def main():
     config = {
         # Data config
         'data_dir': 'data/flickr30k',
-        'batch_size': 16,  # Reduced for memory efficiency
-        'gradient_accumulation_steps': 4,  # Effective batch size = 4 * 4 = 16
+        'batch_size': 8,  # Balanced for memory and speed
+        'gradient_accumulation_steps': 2,  # Effective batch size = 8 * 2 = 16
         'num_epochs': 100,
         'learning_rate': 2e-4,
         'num_timesteps': 1000,
@@ -662,14 +676,14 @@ def main():
         'save_dir': 'outputs/text_conditioned_ddpm',
         'sample_freq': 10,
 
-        # Model config - Reduced for memory efficiency
+        # Model config
         'vocab_size': 10000,
         'text_emb_dim': 256,
         'time_emb_dim': 256,
-        'base_channels': 64,  # Reduced from 128
-        'channel_mult': (1, 2, 2),  # Reduced from (1, 2, 2, 4)
-        'num_res_blocks': 1,  # Reduced from 2
-        'use_attention': (False, True, True),  # Adjusted for 3 levels
+        'base_channels': 96,  # Increased for better quality
+        'channel_mult': (1, 2, 2, 4),  # 4 levels
+        'num_res_blocks': 2,  # 2 blocks per level
+        'use_attention': (False, True, True, False),  # Attention on middle levels
 
         # Pretrained model config
         'pretrained_checkpoint': 'outputs/best_model/pytorch_model.bin',  # From main.py
@@ -804,6 +818,8 @@ def main():
         ddpm=ddpm,
         text_encoder=text_encoder,
         train_loader=train_loader,
+        tokenizer=tokenizer,
+        config=config,
         num_epochs=config['num_epochs'],
         learning_rate=config['learning_rate'],
         save_dir=config['save_dir'],
