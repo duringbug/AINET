@@ -623,18 +623,17 @@ def train_text_conditioned_ddpm(
                 for i, caption in enumerate(captions):
                     f.write(f"{i+1}. {caption}\n")
 
-        # Save checkpoint
-        if (epoch + 1) % 20 == 0 or (epoch + 1) == num_epochs:
-            checkpoint_path = save_dir / 'checkpoints' / f'checkpoint_epoch_{epoch+1}.pt'
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': ddpm.model.state_dict(),
-                'text_encoder_state_dict': text_encoder.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'loss': avg_loss,
-            }, checkpoint_path)
-            logger.info(f'Checkpoint saved to {checkpoint_path}')
+        # Save checkpoint every epoch
+        checkpoint_path = save_dir / 'checkpoints' / f'checkpoint_epoch_{epoch+1}.pt'
+        torch.save({
+            'epoch': epoch + 1,
+            'model_state_dict': ddpm.model.state_dict(),
+            'text_encoder_state_dict': text_encoder.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'loss': avg_loss,
+        }, checkpoint_path)
+        logger.info(f'Checkpoint saved to {checkpoint_path}')
 
     final_path = save_dir / 'final_model.pt'
     torch.save({
@@ -652,7 +651,7 @@ def main():
     config = {
         # Data config
         'data_dir': 'data/flickr30k',
-        'batch_size': 4,  # Reduced for memory efficiency
+        'batch_size': 16,  # Reduced for memory efficiency
         'gradient_accumulation_steps': 4,  # Effective batch size = 4 * 4 = 16
         'num_epochs': 100,
         'learning_rate': 2e-4,
