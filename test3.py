@@ -121,7 +121,7 @@ class SimpleConditionedUNet(nn.Module):
 
 
 class SimpleDDPM(nn.Module):
-    """简化的 DDPM"""
+    """简化的 DDPM with DDIM support"""
 
     def __init__(self, model, num_timesteps=1000, device='cuda'):
         super().__init__()
@@ -148,34 +148,57 @@ class SimpleDDPM(nn.Module):
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
     @torch.no_grad()
-    def sample(self, labels, image_size=28):
-        """Generate images from labels"""
+    def sample(self, labels, image_size=28, ddim_steps=50, ddim_eta=0.0):
+        """Generate images from labels using DDIM sampling
+
+        Args:
+            labels: digit labels to generate
+            image_size: output image size
+            ddim_steps: number of steps for DDIM (default: 50)
+            ddim_eta: DDIM stochasticity parameter (0=deterministic, 1=DDPM-like)
+        """
         self.model.eval()
         batch_size = labels.shape[0]
 
         # Start from noise
         x = torch.randn(batch_size, 1, image_size, image_size).to(self.device)
 
-        for t in reversed(range(self.num_timesteps)):
+        # DDIM sampling: use subset of timesteps
+        step_size = self.num_timesteps // ddim_steps
+        timesteps = list(range(0, self.num_timesteps, step_size))
+        timesteps = list(reversed(timesteps))
+
+        for i, t in enumerate(timesteps):
             t_batch = torch.full((batch_size,), t, dtype=torch.long).to(self.device)
 
             # Predict noise
             predicted_noise = self.model(x, t_batch, labels)
 
-            # Compute denoising step
-            alpha_t = self.alphas[t]
+            # Get alpha values
             alpha_cumprod_t = self.alphas_cumprod[t]
-            beta_t = self.betas[t]
 
-            # x_{t-1}
-            if t > 0:
-                noise = torch.randn_like(x)
+            # Predict x0 from xt and noise
+            pred_x0 = (x - torch.sqrt(1 - alpha_cumprod_t) * predicted_noise) / torch.sqrt(alpha_cumprod_t)
+            pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
+
+            # Get previous timestep
+            if i < len(timesteps) - 1:
+                t_prev = timesteps[i + 1]
+                alpha_cumprod_t_prev = self.alphas_cumprod[t_prev]
             else:
-                noise = 0
+                alpha_cumprod_t_prev = torch.tensor(1.0).to(self.device)
 
-            x = (1 / torch.sqrt(alpha_t)) * (
-                x - (beta_t / torch.sqrt(1 - alpha_cumprod_t)) * predicted_noise
-            ) + torch.sqrt(beta_t) * noise
+            # Compute direction pointing to xt
+            pred_dir = torch.sqrt(1 - alpha_cumprod_t_prev - ddim_eta**2 * (1 - alpha_cumprod_t_prev) / (1 - alpha_cumprod_t) * (1 - alpha_cumprod_t / alpha_cumprod_t_prev)) * predicted_noise
+
+            # Compute x_{t-1}
+            x = torch.sqrt(alpha_cumprod_t_prev) * pred_x0 + pred_dir
+
+            # Add noise (controlled by eta)
+            if ddim_eta > 0 and i < len(timesteps) - 1:
+                sigma = ddim_eta * torch.sqrt((1 - alpha_cumprod_t_prev) / (1 - alpha_cumprod_t)) * torch.sqrt(1 - alpha_cumprod_t / alpha_cumprod_t_prev)
+                noise = torch.randn_like(x)
+                x = x + sigma * noise
 
         return x
 
@@ -281,8 +304,15 @@ def train_mnist_ddpm(num_epochs=20, batch_size=128, device='cuda'):
     logger.info("Training completed!")
 
 
-def test_mnist_generation(checkpoint_path='outputs/mnist_ddpm/final_model.pt', device='cuda'):
-    """测试：输入数字，生成图像"""
+def test_mnist_generation(checkpoint_path='outputs/mnist_ddpm/final_model.pt', device='cuda',
+                         ddim_steps=50):
+    """测试：输入数字，生成图像 (使用DDIM采样器)
+
+    Args:
+        checkpoint_path: path to model checkpoint
+        device: device to use
+        ddim_steps: number of steps for DDIM (default: 50)
+    """
 
     device = torch.device(device if torch.cuda.is_available() else 'cpu')
 
@@ -291,26 +321,31 @@ def test_mnist_generation(checkpoint_path='outputs/mnist_ddpm/final_model.pt', d
     unet.load_state_dict(torch.load(checkpoint_path, map_location=device))
     ddpm = SimpleDDPM(unet, num_timesteps=1000, device=device)
 
-    logger.info("Model loaded!")
+    logger.info(f"Model loaded! Using DDIM-{ddim_steps}steps sampler")
 
     # Generate all digits (0-9), multiple samples each
     output_dir = Path('outputs/mnist_test')
     output_dir.mkdir(exist_ok=True, parents=True)
 
+    import time
+    start_time = time.time()
+
     # Generate 10 samples for each digit
     all_samples = []
     for digit in range(10):
         labels = torch.tensor([digit] * 10).to(device)
-        samples = ddpm.sample(labels)
+        samples = ddpm.sample(labels, ddim_steps=ddim_steps)
         samples = (samples + 1.0) / 2.0
         samples = torch.clamp(samples, 0.0, 1.0)
         all_samples.append(samples)
 
     all_samples = torch.cat(all_samples, dim=0)
     grid = make_grid(all_samples, nrow=10, padding=2)
-    save_image(grid, output_dir / 'all_digits.png')
+    save_image(grid, output_dir / f'all_digits_ddim{ddim_steps}.png')
 
+    elapsed_time = time.time() - start_time
     logger.info(f"Generated images saved to {output_dir}")
+    logger.info(f"Sampling time: {elapsed_time:.2f}s ({elapsed_time/100:.3f}s per image)")
     logger.info("Each row contains 10 samples of the same digit (0-9)")
 
     # Generate specific digits
@@ -319,19 +354,19 @@ def test_mnist_generation(checkpoint_path='outputs/mnist_ddpm/final_model.pt', d
 
     for digit in test_digits:
         labels = torch.tensor([digit] * 16).to(device)
-        samples = ddpm.sample(labels)
+        samples = ddpm.sample(labels, ddim_steps=ddim_steps)
         samples = (samples + 1.0) / 2.0
         samples = torch.clamp(samples, 0.0, 1.0)
 
         grid = make_grid(samples, nrow=4, padding=2)
-        save_image(grid, output_dir / f'digit_{digit}.png')
+        save_image(grid, output_dir / f'digit_{digit}_ddim{ddim_steps}.png')
         logger.info(f"  Generated digit {digit}")
 
 
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description='MNIST Digit Generation')
+    parser = argparse.ArgumentParser(description='MNIST Digit Generation with DDIM')
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'],
                        help='Mode: train or test')
     parser.add_argument('--epochs', type=int, default=20,
@@ -342,6 +377,8 @@ if __name__ == '__main__':
                        help='Checkpoint path for testing')
     parser.add_argument('--device', type=str, default='cuda',
                        help='Device to use')
+    parser.add_argument('--ddim-steps', type=int, default=50,
+                       help='Number of steps for DDIM sampling (default: 50)')
 
     args = parser.parse_args()
 
@@ -353,8 +390,9 @@ if __name__ == '__main__':
             device=args.device
         )
     else:
-        logger.info("=== Testing MNIST Generation ===")
+        logger.info("=== Testing MNIST Generation (DDIM) ===")
         test_mnist_generation(
             checkpoint_path=args.checkpoint,
-            device=args.device
+            device=args.device,
+            ddim_steps=args.ddim_steps
         )

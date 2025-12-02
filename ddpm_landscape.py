@@ -403,6 +403,68 @@ class DDPM(nn.Module):
 
         return x
 
+    @torch.no_grad()
+    def sample_ddim(self, batch_size, channels=3, image_size=64, ddim_steps=50, ddim_eta=0.0):
+        """Generate images using DDIM sampling
+
+        Args:
+            batch_size: number of images to generate
+            channels: number of channels (3 for RGB)
+            image_size: size of generated images
+            ddim_steps: number of steps for DDIM (fewer steps = faster)
+            ddim_eta: stochasticity parameter (0=deterministic, 1=DDPM-like)
+
+        Returns:
+            Generated images tensor
+        """
+        self.model.eval()
+
+        # Start from noise
+        x = torch.randn(batch_size, channels, image_size, image_size).to(self.device)
+
+        # DDIM sampling: use subset of timesteps
+        step_size = self.num_timesteps // ddim_steps
+        timesteps = list(range(0, self.num_timesteps, step_size))
+        timesteps = list(reversed(timesteps))
+
+        for i, t in enumerate(tqdm(timesteps, desc='DDIM Sampling')):
+            t_batch = torch.full((batch_size,), t, dtype=torch.long).to(self.device)
+
+            # Predict noise
+            predicted_noise = self.model(x, t_batch)
+
+            # Get alpha values
+            alpha_cumprod_t = self.alphas_cumprod[t]
+
+            # Predict x0 from xt and noise
+            pred_x0 = (x - torch.sqrt(1 - alpha_cumprod_t) * predicted_noise) / torch.sqrt(alpha_cumprod_t)
+            pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
+
+            # Get previous timestep
+            if i < len(timesteps) - 1:
+                t_prev = timesteps[i + 1]
+                alpha_cumprod_t_prev = self.alphas_cumprod[t_prev]
+            else:
+                alpha_cumprod_t_prev = torch.tensor(1.0).to(self.device)
+
+            # Compute direction pointing to xt
+            sigma_t = ddim_eta * torch.sqrt(
+                (1 - alpha_cumprod_t_prev) / (1 - alpha_cumprod_t) *
+                (1 - alpha_cumprod_t / alpha_cumprod_t_prev)
+            )
+
+            pred_dir = torch.sqrt(1 - alpha_cumprod_t_prev - sigma_t**2) * predicted_noise
+
+            # Compute x_{t-1}
+            x = torch.sqrt(alpha_cumprod_t_prev) * pred_x0 + pred_dir
+
+            # Add noise (controlled by eta)
+            if ddim_eta > 0 and i < len(timesteps) - 1:
+                noise = torch.randn_like(x)
+                x = x + sigma_t * noise
+
+        return x
+
     def forward(self, x_start):
         batch_size = x_start.shape[0]
         t = torch.randint(0, self.num_timesteps, (batch_size,)).long().to(self.device)
@@ -586,5 +648,125 @@ def main():
     logger.info('Training completed!')
 
 
+def test_ddim_sampling(
+    checkpoint_path='outputs/ddpm_landscape/ddpm_final.pt',
+    save_dir='outputs/ddpm_landscape/ddim_samples',
+    ddim_steps=50,
+    num_samples=16,
+    image_size=64,
+    device='cuda'
+):
+    """Test DDIM sampling with a trained model
+
+    Args:
+        checkpoint_path: path to trained model checkpoint
+        save_dir: directory to save generated samples
+        ddim_steps: number of DDIM steps (e.g., 50, 100, 200)
+        num_samples: number of images to generate
+        image_size: size of generated images
+        device: device to use
+    """
+    device = torch.device(device if torch.cuda.is_available() else 'cpu')
+    logger.info(f'Using device: {device}')
+
+    # Load model
+    logger.info(f'Loading model from {checkpoint_path}...')
+    unet = UNet(
+        in_channels=3,
+        out_channels=3,
+        time_emb_dim=256,
+        base_channels=128,
+        channel_mult=(1, 2, 2, 4),
+        num_res_blocks=2,
+        use_attention=(False, True, True, False),
+    ).to(device)
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    unet.load_state_dict(checkpoint['model_state_dict'])
+
+    ddpm = DDPM(
+        model=unet,
+        num_timesteps=1000,
+        device=device
+    )
+
+    logger.info(f'Model loaded successfully!')
+
+    # Create save directory
+    save_dir = Path(save_dir)
+    save_dir.mkdir(exist_ok=True, parents=True)
+
+    # Test DDIM sampling
+    import time
+
+    logger.info(f'\nGenerating {num_samples} samples with DDIM-{ddim_steps}...')
+    start_time = time.time()
+
+    samples = ddpm.sample_ddim(
+        batch_size=num_samples,
+        channels=3,
+        image_size=image_size,
+        ddim_steps=ddim_steps,
+        ddim_eta=0.0  # Deterministic sampling
+    )
+
+    elapsed_time = time.time() - start_time
+    logger.info(f'Sampling completed in {elapsed_time:.2f}s ({elapsed_time/num_samples:.3f}s per image)')
+
+    # Normalize and save
+    samples = (samples + 1.0) / 2.0
+    samples = torch.clamp(samples, 0.0, 1.0)
+
+    grid = make_grid(samples, nrow=4, padding=2)
+    save_image(grid, save_dir / f'ddim_{ddim_steps}steps.png')
+    logger.info(f'Saved to {save_dir / f"ddim_{ddim_steps}steps.png"}')
+
+    # Test with different eta values (stochasticity)
+    logger.info(f'\nTesting different eta values (stochasticity)...')
+    for eta in [0.0, 0.5, 1.0]:
+        logger.info(f'Generating samples with DDIM-50 and eta={eta}...')
+
+        samples = ddpm.sample_ddim(
+            batch_size=num_samples,
+            channels=3,
+            image_size=image_size,
+            ddim_steps=50,
+            ddim_eta=eta
+        )
+
+        samples = (samples + 1.0) / 2.0
+        samples = torch.clamp(samples, 0.0, 1.0)
+
+        grid = make_grid(samples, nrow=4, padding=2)
+        save_image(grid, save_dir / f'ddim_50steps_eta{eta}.png')
+        logger.info(f'Saved to {save_dir / f"ddim_50steps_eta{eta}.png"}')
+
+    logger.info(f'\nAll samples saved to {save_dir}')
+
+
 if __name__ == '__main__':
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description='DDPM for Landscape Images')
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test_ddim'],
+                       help='Mode: train or test_ddim')
+    parser.add_argument('--checkpoint', type=str, default='outputs/ddpm_landscape/ddpm_final.pt',
+                       help='Checkpoint path for testing')
+    parser.add_argument('--ddim-steps', type=int, default=50,
+                       help='Number of DDIM steps')
+    parser.add_argument('--num-samples', type=int, default=16,
+                       help='Number of samples to generate')
+    parser.add_argument('--device', type=str, default='cuda',
+                       help='Device to use')
+
+    args = parser.parse_args()
+
+    if args.mode == 'train':
+        main()
+    elif args.mode == 'test_ddim':
+        test_ddim_sampling(
+            checkpoint_path=args.checkpoint,
+            ddim_steps=args.ddim_steps,
+            num_samples=args.num_samples,
+            device=args.device
+        )
