@@ -185,7 +185,7 @@ def train_clip_lora_ddpm(
                 text_tokens = clip.tokenize(captions, truncate=True).to(device)
                 text_features = clip_trainer.model.encode_text(text_tokens)
                 text_features = F.normalize(text_features, dim=-1)
-                text_context = text_features.unsqueeze(1)
+                text_context = text_features.unsqueeze(1).float()  # Convert to float32 for DDPM
 
             # Generate images
             samples = ddpm.sample(text_context, channels=3, image_size=image_size)
@@ -312,7 +312,7 @@ def generate_images(
             text_tokens = clip.tokenize(batch_prompts, truncate=True).to(device)
             text_features = clip_trainer.model.encode_text(text_tokens)
             text_features = F.normalize(text_features, dim=-1)
-            text_context = text_features.unsqueeze(1)
+            text_context = text_features.unsqueeze(1).float()  # Convert to float32 for DDPM
 
             # Generate images
             samples = ddpm.sample(text_context, channels=3, image_size=image_size)
